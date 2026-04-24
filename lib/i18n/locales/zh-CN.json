@@ -26,7 +26,9 @@
     "ttsTitle": "语音合成",
     "ttsHint": "选择 AI 教师的朗读音色",
     "ttsPreview": "试听",
-    "ttsPreviewing": "播放中..."
+    "ttsPreviewing": "播放中...",
+    "interactiveModeHint": "开启深度交互模式，生成更多互动内容",
+    "interactiveModeLabel": "深度交互"
   },
   "export": {
     "pptx": "导出 PPTX",
@@ -278,7 +280,11 @@
     "delete": "删除",
     "rename": "重命名",
     "renamePlaceholder": "输入课堂名称",
-    "renameFailed": "重命名失败"
+    "renameFailed": "重命名失败",
+    "searchPlaceholder": "搜索课程...",
+    "searchAriaLabel": "搜索课程",
+    "clearSearch": "清空",
+    "searchEmpty": "没有找到匹配的课程"
   },
   "upload": {
     "pdfSizeLimit": "支持最大50MB的PDF文件",
@@ -419,6 +425,10 @@
       "glm": "GLM",
       "siliconflow": "硅基流动",
       "doubao": "豆包",
+      "openrouter": "OpenRouter",
+      "grok": "Grok",
+      "tencent-hunyuan": "腾讯混元",
+      "xiaomi": "小米 MiMo",
       "ollama": "Ollama（本地模型）"
     },
     "providerTypes": {
@@ -441,6 +451,10 @@
     "importFromClipboard": "从剪贴板导入",
     "apiSecret": "API 密钥",
     "apiHost": "Base URL",
+    "baseUrlRegion": {
+      "china": "国内站",
+      "international": "国际站"
+    },
     "requestUrl": "请求地址",
     "models": "模型",
     "addModel": "新建",
@@ -569,6 +583,7 @@
     "providerQwenASR": "Qwen ASR（阿里云百炼）",
     "providerUnpdf": "unpdf（内置）",
     "providerMinerU": "MinerU",
+    "providerMinerUCloud": "MinerU（云端）",
     "browserNativeTTSNote": "浏览器原生 TTS 无需配置，完全免费，使用系统内置语音",
     "testTTS": "测试 TTS",
     "testASR": "测试 ASR",
@@ -797,6 +812,7 @@
     "mineruLocalDescription": "MinerU 支持本地部署，提供高级 PDF 解析功能（表格、公式、布局分析）。需要先部署 MinerU 服务。",
     "mineruServerAddress": "本地 MinerU 服务器地址（如：http://localhost:8080）",
     "mineruApiKeyOptional": "仅在服务器启用认证时需要",
+    "mineruCloudApiKeyPlaceholder": "输入 MinerU Cloud API Key",
     "optionalApiKey": "可选的 API Key",
     "featureText": "文本提取",
     "featureImages": "图片提取",
@@ -811,6 +827,7 @@
     "imageProvider": "图像生成提供商",
     "imageModel": "图像生成模型",
     "providerSeedream": "Seedream（字节豆包）",
+    "providerOpenAIImage": "OpenAI 图像",
     "providerQwenImage": "Qwen Image（阿里通义）",
     "providerNanoBanana": "Nano Banana（Gemini）",
     "providerMiniMaxImage": "MiniMax 图像",

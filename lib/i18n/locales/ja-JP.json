@@ -26,7 +26,9 @@
     "ttsTitle": "音声合成",
     "ttsHint": "AI教師の声を選択",
     "ttsPreview": "プレビュー",
-    "ttsPreviewing": "再生中..."
+    "ttsPreviewing": "再生中...",
+    "interactiveModeHint": "インタラクティブ優先モードを有効にして、より実践的なコンテンツを生成",
+    "interactiveModeLabel": "インタラクティブモード"
   },
   "export": {
     "pptx": "PPTXエクスポート",
@@ -278,7 +280,11 @@
     "delete": "削除",
     "rename": "名前を変更",
     "renamePlaceholder": "教室名を入力",
-    "renameFailed": "教室名の変更に失敗しました"
+    "renameFailed": "教室名の変更に失敗しました",
+    "searchPlaceholder": "コースを検索...",
+    "searchAriaLabel": "コースを検索",
+    "clearSearch": "クリア",
+    "searchEmpty": "該当するコースが見つかりません"
   },
   "upload": {
     "pdfSizeLimit": "50MBまでのPDFファイルに対応しています",
@@ -419,6 +425,10 @@
       "glm": "GLM",
       "siliconflow": "SiliconFlow",
       "doubao": "豆包",
+      "openrouter": "OpenRouter",
+      "grok": "Grok",
+      "tencent-hunyuan": "Tencent Hunyuan",
+      "xiaomi": "Xiaomi MiMo",
       "ollama": "Ollama（ローカルモデル）"
     },
     "providerTypes": {
@@ -441,6 +451,10 @@
     "importFromClipboard": "クリップボードからインポート",
     "apiSecret": "APIキー",
     "apiHost": "ベースURL",
+    "baseUrlRegion": {
+      "china": "中国",
+      "international": "国際"
+    },
     "requestUrl": "リクエストURL",
     "models": "モデル",
     "addModel": "新規",
@@ -569,6 +583,7 @@
     "providerQwenASR": "Qwen ASR（Alibaba Cloud百錬）",
     "providerUnpdf": "unpdf（組み込み）",
     "providerMinerU": "MinerU",
+    "providerMinerUCloud": "MinerU（クラウド）",
     "browserNativeTTSNote": "ブラウザネイティブTTSは設定不要で完全無料です。システム内蔵のボイスを使用します",
     "testTTS": "TTSをテスト",
     "testASR": "ASRをテスト",
@@ -797,6 +812,7 @@
     "mineruLocalDescription": "MinerUはローカルデプロイに対応し、高度なPDF解析（表、数式、レイアウト分析）が可能です。事前にMinerUサービスのデプロイが必要です。",
     "mineruServerAddress": "ローカルMinerUサーバーアドレス（例：http://localhost:8080）",
     "mineruApiKeyOptional": "サーバーで認証が有効な場合のみ必要",
+    "mineruCloudApiKeyPlaceholder": "MinerU Cloud API キーを入力",
     "optionalApiKey": "APIキー（任意）",
     "featureText": "テキスト抽出",
     "featureImages": "画像抽出",
@@ -811,6 +827,7 @@
     "imageProvider": "画像生成プロバイダー",
     "imageModel": "画像生成モデル",
     "providerSeedream": "Seedream（ByteDance）",
+    "providerOpenAIImage": "OpenAI Image",
     "providerQwenImage": "Qwen Image（Alibaba）",
     "providerNanoBanana": "Nano Banana（Gemini）",
     "providerMiniMaxImage": "MiniMax Image",

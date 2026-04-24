@@ -26,7 +26,9 @@
     "ttsTitle": "Text-to-Speech",
     "ttsHint": "Choose a voice for the AI teacher",
     "ttsPreview": "Preview",
-    "ttsPreviewing": "Playing..."
+    "ttsPreviewing": "Playing...",
+    "interactiveModeHint": "Enable interactive-first mode for more hands-on content",
+    "interactiveModeLabel": "Interactive Mode"
   },
   "export": {
     "pptx": "Export PPTX",
@@ -278,7 +280,11 @@
     "delete": "Delete",
     "rename": "Rename",
     "renamePlaceholder": "Enter classroom name",
-    "renameFailed": "Failed to rename classroom"
+    "renameFailed": "Failed to rename classroom",
+    "searchPlaceholder": "Search courses...",
+    "searchAriaLabel": "Search courses",
+    "clearSearch": "Clear",
+    "searchEmpty": "No courses match your search"
   },
   "upload": {
     "pdfSizeLimit": "Supports PDF files up to 50MB",
@@ -419,6 +425,10 @@
       "glm": "GLM",
       "siliconflow": "SiliconFlow",
       "doubao": "Doubao",
+      "openrouter": "OpenRouter",
+      "grok": "Grok",
+      "tencent-hunyuan": "Tencent Hunyuan",
+      "xiaomi": "Xiaomi MiMo",
       "ollama": "Ollama (Local)"
     },
     "providerTypes": {
@@ -441,6 +451,10 @@
     "importFromClipboard": "Import from Clipboard",
     "apiSecret": "API Key",
     "apiHost": "Base URL",
+    "baseUrlRegion": {
+      "china": "China",
+      "international": "International"
+    },
     "requestUrl": "Request URL",
     "models": "Models",
     "addModel": "New",
@@ -569,6 +583,7 @@
     "providerQwenASR": "Qwen ASR (Alibaba Cloud Bailian)",
     "providerUnpdf": "unpdf (Built-in)",
     "providerMinerU": "MinerU",
+    "providerMinerUCloud": "MinerU (Cloud)",
     "browserNativeTTSNote": "Browser Native TTS requires no configuration and is completely free, using system built-in voices",
     "testTTS": "Test TTS",
     "testASR": "Test ASR",
@@ -797,6 +812,7 @@
     "mineruLocalDescription": "MinerU supports local deployment with advanced PDF parsing (tables, formulas, layout analysis). Requires deploying MinerU service first.",
     "mineruServerAddress": "Local MinerU server address (e.g., http://localhost:8080)",
     "mineruApiKeyOptional": "Only required if server has authentication enabled",
+    "mineruCloudApiKeyPlaceholder": "Enter MinerU Cloud API Key",
     "optionalApiKey": "Optional API Key",
     "featureText": "Text Extraction",
     "featureImages": "Image Extraction",
@@ -811,6 +827,7 @@
     "imageProvider": "Image Generation Provider",
     "imageModel": "Image Generation Model",
     "providerSeedream": "Seedream (ByteDance)",
+    "providerOpenAIImage": "OpenAI Image",
     "providerQwenImage": "Qwen Image (Alibaba)",
     "providerNanoBanana": "Nano Banana (Gemini)",
     "providerMiniMaxImage": "MiniMax Image",

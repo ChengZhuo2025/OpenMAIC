@@ -338,6 +338,7 @@ const getDefaultPDFConfig = () => ({
   pdfProvidersConfig: {
     unpdf: { apiKey: '', baseUrl: '', enabled: true },
     mineru: { apiKey: '', baseUrl: '', enabled: false },
+    'mineru-cloud': { apiKey: '', baseUrl: '', enabled: false },
   } as Record<PDFProviderId, { apiKey: string; baseUrl: string; enabled: boolean }>,
 });
 
@@ -347,6 +348,7 @@ const getDefaultImageConfig = () => ({
   imageModelId: 'doubao-seedream-5-0-260128',
   imageProvidersConfig: {
     seedream: { apiKey: '', baseUrl: '', enabled: false },
+    'openai-image': { apiKey: '', baseUrl: '', enabled: false },
     'qwen-image': { apiKey: '', baseUrl: '', enabled: false },
     'nano-banana': { apiKey: '', baseUrl: '', enabled: false },
     'minimax-image': { apiKey: '', baseUrl: '', enabled: false },
@@ -450,14 +452,14 @@ function ensureBuiltInProviders(state: Partial<SettingsState>): void {
       // New provider: add with defaults
       state.providersConfig![providerId] = defaultConfig[providerId];
     } else {
-      // Existing provider: merge new models & metadata
+      // Existing provider: refresh built-in models from the registry and
+      // keep user-added models after the built-in list.
       const provider = PROVIDERS[providerId];
       const existing = state.providersConfig![providerId];
 
-      const existingModelIds = new Set(existing.models?.map((m) => m.id) || []);
-      const newModels = provider.models.filter((m) => !existingModelIds.has(m.id));
-      const mergedModels =
-        newModels.length > 0 ? [...newModels, ...(existing.models || [])] : existing.models;
+      const builtInModelIds = new Set(provider.models.map((m) => m.id));
+      const customModels = (existing.models || []).filter((m) => !builtInModelIds.has(m.id));
+      const mergedModels = [...provider.models, ...customModels];
 
       state.providersConfig![providerId] = {
         ...existing,
@@ -919,8 +921,10 @@ export const useSettingsStore = create<SettingsState>()(
                 if (newProvidersConfig[key]) {
                   const currentModels = newProvidersConfig[key].models;
                   // When server specifies allowed models, filter the models list
+                  // while preserving custom IDs from env/YAML in server order.
+                  const currentModelMap = new Map(currentModels.map((m) => [m.id, m]));
                   const filteredModels = info.models?.length
-                    ? currentModels.filter((m) => info.models!.includes(m.id))
+                    ? info.models.map((id) => currentModelMap.get(id) ?? { id, name: id })
                     : currentModels;
                   newProvidersConfig[key] = {
                     ...newProvidersConfig[key],
@@ -1185,9 +1189,13 @@ export const useSettingsStore = create<SettingsState>()(
               let autoVideoEnabled: boolean | undefined;
 
               if (!state.autoConfigApplied) {
-                // PDF: unpdf → mineru if server has it
-                if (newPDFConfig.mineru?.isServerConfigured && state.pdfProviderId === 'unpdf') {
-                  autoPdfProvider = 'mineru' as PDFProviderId;
+                // PDF: unpdf → mineru-cloud or mineru if server has it
+                if (state.pdfProviderId === 'unpdf') {
+                  if (newPDFConfig['mineru-cloud']?.isServerConfigured) {
+                    autoPdfProvider = 'mineru-cloud' as PDFProviderId;
+                  } else if (newPDFConfig.mineru?.isServerConfigured) {
+                    autoPdfProvider = 'mineru' as PDFProviderId;
+                  }
                 }
 
                 // TTS: select first server provider if current is not server-configured
