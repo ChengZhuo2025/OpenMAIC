@@ -1,0 +1,63 @@
+import { describe, expect, it } from 'vitest';
+
+import { getProvider } from '@/lib/ai/providers';
+import { supportsConfigurableThinking } from '@/lib/ai/thinking-config';
+
+describe('Xiaomi MiMo provider defaults', () => {
+  it('exposes pay-as-you-go and Token Plan OpenAI-compatible endpoints', () => {
+    const provider = getProvider('xiaomi');
+
+    expect(provider?.defaultBaseUrl).toBe('https://api.xiaomimimo.com/v1');
+    expect(provider?.alternateBaseUrls).toEqual([
+      { label: 'settings.baseUrlRegion.xiaomiPayg', url: 'https://api.xiaomimimo.com/v1' },
+      {
+        label: 'settings.baseUrlRegion.xiaomiTokenPlanCN',
+        url: 'https://token-plan-cn.xiaomimimo.com/v1',
+      },
+      {
+        label: 'settings.baseUrlRegion.xiaomiTokenPlanSGP',
+        url: 'https://token-plan-sgp.xiaomimimo.com/v1',
+      },
+      {
+        label: 'settings.baseUrlRegion.xiaomiTokenPlanEU',
+        url: 'https://token-plan-ams.xiaomimimo.com/v1',
+      },
+    ]);
+  });
+
+  it('matches the supported MiMo text and multimodal model catalog', () => {
+    const modelIds = getProvider('xiaomi')?.models.map((model) => model.id) ?? [];
+
+    expect(modelIds).toEqual(['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.5-pro', 'mimo-v2.5']);
+  });
+
+  it('registers MiMo V2.6 models with their documented limits and capabilities', () => {
+    const models = getProvider('xiaomi')?.models ?? [];
+
+    for (const modelId of ['mimo-v2.6-pro', 'mimo-v2.6-flash']) {
+      expect(models.find((model) => model.id === modelId)).toMatchObject({
+        contextWindow: 1048576,
+        outputWindow: 131072,
+        capabilities: {
+          streaming: true,
+          tools: true,
+          vision: true,
+          thinking: {
+            control: 'toggle',
+            requestAdapter: 'xiaomi',
+            toggleable: true,
+          },
+        },
+      });
+    }
+  });
+
+  it('marks MiMo reasoning models as configurable thinking models', () => {
+    const models = getProvider('xiaomi')?.models ?? [];
+
+    for (const model of models) {
+      expect(model.capabilities?.thinking?.requestAdapter).toBe('xiaomi');
+      expect(supportsConfigurableThinking(model.capabilities?.thinking)).toBe(true);
+    }
+  });
+});

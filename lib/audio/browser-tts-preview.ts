@@ -9,6 +9,8 @@ type PlayBrowserTTSPreviewOptions = {
   voice?: string;
   rate?: number;
   voices?: SpeechSynthesisVoice[];
+  /** UI language for the Chinese region or text without a strong language signal. */
+  locale?: string;
 };
 
 function createAbortError(): Error {
@@ -17,10 +19,27 @@ function createAbortError(): Error {
   return error;
 }
 
-function inferPreviewLang(text: string): string {
-  const cjkCount = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length;
-  const ratio = text.length > 0 ? cjkCount / text.length : 0;
-  return ratio > CJK_LANG_THRESHOLD ? 'zh-CN' : 'en-US';
+// U+0110/0111 (đ), U+01A0/01A1 (ơ), U+01AF/01B0 (ư) and the U+1EA0–U+1EF9
+// precomposed block (ớ, ừ, ồ, ế, ấ, …) never occur in French or Romanian
+// Latin, so one occurrence marks Vietnamese. Bare ă/â/ê/ô do occur in
+// Romanian (and ê/ô in lone French words like "fête"), so they only count
+// toward a ratio — this does not fully exclude Romanian prose, which is
+// acceptable because narration chunks follow the course language.
+const VI_DECIDER_RE = /[đĐơƠưƯ\u1EA0-\u1EF9]/;
+const VI_BROAD_RE = /[ăâêôĂÂÊÔ]/g;
+const VI_BROAD_THRESHOLD = 0.02;
+
+/** Detect Chinese/Vietnamese text, retaining the UI's Chinese region when available. */
+export function detectSpeechLang(text: string, fallbackLang = 'en-US'): string {
+  if (!text) return fallbackLang || 'en-US';
+  const cjkRatio = (text.match(/[\u4e00-\u9fff\u3400-\u4dbf]/g) || []).length / text.length;
+  if (cjkRatio > CJK_LANG_THRESHOLD) {
+    // 汉字比例只能识别语言，不能区分地区；中文界面继续使用用户所在地区的音色。
+    return fallbackLang.toLowerCase().startsWith('zh-') ? fallbackLang : 'zh-CN';
+  }
+  if (VI_DECIDER_RE.test(text)) return 'vi-VN';
+  if ((text.match(VI_BROAD_RE) || []).length / text.length > VI_BROAD_THRESHOLD) return 'vi-VN';
+  return fallbackLang || 'en-US';
 }
 
 export function isBrowserTTSAbortError(error: unknown): boolean {
@@ -73,6 +92,7 @@ export function resolveBrowserVoice(
   voices: SpeechSynthesisVoice[],
   voiceNameOrLang: string,
   text: string,
+  locale?: string,
 ): { voice: SpeechSynthesisVoice | null; lang: string } {
   const target = voiceNameOrLang.trim();
   const matchedVoice =
@@ -84,7 +104,7 @@ export function resolveBrowserVoice(
 
   return {
     voice: matchedVoice,
-    lang: matchedVoice?.lang || inferPreviewLang(text),
+    lang: matchedVoice?.lang || detectSpeechLang(text, locale),
   };
 }
 
@@ -153,7 +173,12 @@ export function playBrowserTTSPreview(options: PlayBrowserTTSPreviewOptions): {
         const utterance = new SpeechSynthesisUtterance(options.text);
         utterance.rate = options.rate ?? 1;
 
-        const { voice, lang } = resolveBrowserVoice(voices, options.voice ?? '', options.text);
+        const { voice, lang } = resolveBrowserVoice(
+          voices,
+          options.voice ?? '',
+          options.text,
+          options.locale,
+        );
         if (voice) {
           utterance.voice = voice;
         }

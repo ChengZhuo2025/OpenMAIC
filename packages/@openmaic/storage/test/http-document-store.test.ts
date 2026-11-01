@@ -1,0 +1,589 @@
+import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
+import { IDBFactory } from 'fake-indexeddb';
+import { DSL_VERSION_KEY } from '@openmaic/dsl';
+import { describe, expect, test } from 'vitest';
+import { BrowserDocumentStore } from '../src/document/browser.js';
+import {
+  DocumentVersionError,
+  DocumentWriteRefusedError,
+  isDocumentWriteRefusedError,
+} from '../src/document/types.js';
+import { HttpDocumentStore, HttpDocumentStoreError } from '../src/document/http.js';
+import type { StageValidator } from '../src/document/types.js';
+import { BrowserRuntimeStore } from '../src/runtime/browser.js';
+import { createStorageHttpHandler } from '../src/server/index.js';
+import { makeDocument, runDocumentStoreContract, slideScene } from './document-contract.js';
+
+const BASE_URL = 'http://storage-reference.invalid';
+
+function handlerFetch(handler: RequestListener): typeof globalThis.fetch {
+  return async (input, init) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    const body = await request.text();
+    const headers = Object.fromEntries(request.headers.entries());
+    headers.authorization ??= 'Bearer document-contract';
+    const fakeRequest = {
+      method: request.method,
+      url: `${url.pathname}${url.search}`,
+      headers,
+      async *[Symbol.asyncIterator]() {
+        if (body !== '') yield Buffer.from(body);
+      },
+    } as unknown as IncomingMessage;
+
+    return new Promise<Response>((resolve, reject) => {
+      let status = 200;
+      let responseHeaders: Record<string, string> = {};
+      let responseBody: string | undefined;
+      let headersSent = false;
+      const fakeResponse = {
+        get headersSent() {
+          return headersSent;
+        },
+        writeHead(nextStatus: number, nextHeaders?: Record<string, string>) {
+          status = nextStatus;
+          responseHeaders = nextHeaders ?? {};
+          headersSent = true;
+          return this;
+        },
+        end(chunk?: string | Buffer) {
+          responseBody = chunk === undefined ? undefined : chunk.toString();
+          resolve(
+            new Response(status === 204 ? null : responseBody, {
+              status,
+              headers: responseHeaders,
+            }),
+          );
+          return this;
+        },
+        destroy(error?: Error) {
+          reject(error ?? new Error('response destroyed'));
+          return this;
+        },
+      } as unknown as ServerResponse;
+      handler(fakeRequest, fakeResponse);
+    });
+  };
+}
+
+async function reStampStage(
+  idb: IDBFactory,
+  dbName: string,
+  stageId: string,
+  version: string | undefined,
+): Promise<void> {
+  const db = await new Promise<IDBDatabase>((resolve, reject) => {
+    const request = idb.open(dbName);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+  await new Promise<void>((resolve, reject) => {
+    const transaction = db.transaction('stages', 'readwrite');
+    const stages = transaction.objectStore('stages');
+    const request = stages.get(stageId);
+    request.onsuccess = () => {
+      const row = request.result as Record<string, unknown>;
+      if (version === undefined) delete row[DSL_VERSION_KEY];
+      else row[DSL_VERSION_KEY] = version;
+      stages.put(row);
+    };
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+  });
+  db.close();
+}
+
+let harnessDb = 0;
+function makeHarness(
+  authorizeDocuments: () => boolean = () => true,
+  options: { maxBodyBytes?: number; validateStage?: StageValidator } = {},
+) {
+  const idb = new IDBFactory();
+  const dbName = `http-document-contract-${harnessDb++}`;
+  const documents = new BrowserDocumentStore({ indexedDB: idb, dbName });
+  const runtime = new BrowserRuntimeStore({ indexedDB: new IDBFactory() });
+  const handler = createStorageHttpHandler(runtime, documents, {
+    authenticate: async (req) => {
+      const authorization = req.headers.authorization;
+      return typeof authorization === 'string' && authorization.startsWith('Bearer ')
+        ? { learnerKey: 'author' }
+        : undefined;
+    },
+    authorizeDocuments: async () => authorizeDocuments(),
+    ...(options.maxBodyBytes === undefined ? {} : { maxBodyBytes: options.maxBodyBytes }),
+    ...(options.validateStage === undefined ? {} : { validateStage: options.validateStage }),
+  });
+  const fetch = handlerFetch(handler);
+  return {
+    documents,
+    fetch,
+    client: new HttpDocumentStore({ baseUrl: BASE_URL, fetch }),
+    seedStoredVersion: (stageId: string, version: string | undefined) =>
+      reStampStage(idb, dbName, stageId, version),
+  };
+}
+
+runDocumentStoreContract('reference HTTP', () => {
+  const harness = makeHarness();
+  return {
+    store: harness.client,
+    seedStoredVersion: harness.seedStoredVersion,
+  };
+});
+
+describe('HttpDocumentStore contract mapping', () => {
+  test('uses injected request headers and the reference server requires authentication', async () => {
+    const { fetch } = makeHarness();
+    const unauthenticated = await fetch(`${BASE_URL}/documents`, {
+      headers: { authorization: '' },
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    let context: { method: string; path: string } | undefined;
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch,
+      headers: (next) => {
+        context = next;
+        return { authorization: 'Bearer author' };
+      },
+    });
+    await client.listDocuments();
+    expect(context).toEqual({ method: 'GET', path: '/documents' });
+  });
+
+  test('maps document authorization denial to a typed 403', async () => {
+    const { client } = makeHarness(() => false);
+    await expect(client.listDocuments()).rejects.toMatchObject({
+      name: 'HttpDocumentStoreError',
+      status: 403,
+      code: 'FORBIDDEN_DOCUMENTS',
+    });
+  });
+
+  test('maps a store refusal to 403 with the refusal code and applies nothing', async () => {
+    const { documents, client } = makeHarness();
+    const refusing = Object.create(documents) as typeof documents;
+    refusing.saveDocument = async (document) => {
+      throw new DocumentWriteRefusedError(document.stage.id, 'CREATE_REFUSED', 'not allowed');
+    };
+    const handler = createStorageHttpHandler(
+      new BrowserRuntimeStore({ indexedDB: new IDBFactory() }),
+      refusing,
+      {
+        authenticate: async () => ({ learnerKey: 'author' }),
+        authorizeDocuments: async () => true,
+      },
+    );
+    const refusedClient = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: handlerFetch(handler),
+    });
+
+    const failure = refusedClient.saveDocument(makeDocument());
+    await expect(failure).rejects.toBeInstanceOf(HttpDocumentStoreError);
+    await expect(failure).rejects.toMatchObject({ status: 403, code: 'CREATE_REFUSED' });
+    await expect(client.loadDocument('stage-1')).resolves.toBeNull();
+  });
+
+  test('maps a refusal from another copy of the package by name and shape, not by code alone', async () => {
+    const { documents } = makeHarness();
+    // Structurally the class, built without it: what a host store bundled
+    // with a second copy of this package throws.
+    const lookalike = Object.assign(new Error('refused elsewhere'), {
+      name: 'DocumentWriteRefusedError',
+      code: 'CREATE_REFUSED',
+      stageId: 'stage-1',
+    });
+    // A database error: an upper-case code, but not a refusal.
+    const sqlstate = Object.assign(new Error('raise exception'), { code: 'P0001' });
+    expect(isDocumentWriteRefusedError(lookalike)).toBe(true);
+    expect(isDocumentWriteRefusedError(sqlstate)).toBe(false);
+    // Not an Error, or an Error without a string message: never a refusal.
+    expect(
+      isDocumentWriteRefusedError({
+        name: 'DocumentWriteRefusedError',
+        code: 'CREATE_REFUSED',
+        stageId: 's',
+        message: 'plain object',
+      }),
+    ).toBe(false);
+    expect(
+      isDocumentWriteRefusedError(
+        Object.assign(new Error('x'), {
+          name: 'DocumentWriteRefusedError',
+          code: 'CREATE_REFUSED',
+          stageId: 's',
+          message: 42,
+        }),
+      ),
+    ).toBe(false);
+    expect(
+      isDocumentWriteRefusedError(
+        Object.assign(new Error('x'), {
+          name: 'DocumentWriteRefusedError',
+          code: 'lower',
+          stageId: 's',
+        }),
+      ),
+    ).toBe(false);
+
+    for (const [thrown, status] of [
+      [lookalike, 403],
+      [sqlstate, 500],
+    ] as const) {
+      const refusing = Object.create(documents) as typeof documents;
+      refusing.saveDocument = async () => {
+        throw thrown;
+      };
+      const handler = createStorageHttpHandler(
+        new BrowserRuntimeStore({ indexedDB: new IDBFactory() }),
+        refusing,
+        {
+          authenticate: async () => ({ learnerKey: 'author' }),
+          authorizeDocuments: async () => true,
+        },
+      );
+      const response = await handlerFetch(handler)(`${BASE_URL}/documents/stage-1`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(makeDocument()),
+      });
+      expect(response.status).toBe(status);
+    }
+  });
+
+  test('refuses a refusal code outside the machine-readable alphabet', () => {
+    expect(() => new DocumentWriteRefusedError('stage-1', 'not a code', 'x')).toThrow(TypeError);
+    expect(new DocumentWriteRefusedError('stage-1', 'CREATE_REFUSED', 'x').code).toBe(
+      'CREATE_REFUSED',
+    );
+  });
+
+  test('maps malformed request JSON to VALIDATION_FAILED', async () => {
+    const { fetch } = makeHarness();
+    const response = await fetch(`${BASE_URL}/documents/stage-1`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: '{',
+    });
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: 'VALIDATION_FAILED' },
+    });
+  });
+
+  test('rejects oversized bodies with 413 while allowing an under-limit request', async () => {
+    const { fetch } = makeHarness(() => true, { maxBodyBytes: 256 });
+    const overLimit = await fetch(`${BASE_URL}/documents/stage-1`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ padding: 'x'.repeat(300) }),
+    });
+    expect(overLimit.status).toBe(413);
+    await expect(overLimit.json()).resolves.toMatchObject({
+      error: { code: 'PAYLOAD_TOO_LARGE' },
+    });
+
+    const underLimit = await fetch(`${BASE_URL}/documents/stage-1/stage`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        id: 'stage-1',
+        name: 'Missing parent',
+        createdAt: 1,
+        updatedAt: 2,
+      }),
+    });
+    expect(underLimit.status).toBe(404);
+  });
+
+  test('fails loud when a structured-clone document is not JSON-safe on read', async () => {
+    const { documents, fetch } = makeHarness();
+    const document = makeDocument();
+    document.outline = { generatedAt: new Date('2026-01-01T00:00:00.000Z') };
+    await documents.saveDocument(document);
+
+    const response = await fetch(`${BASE_URL}/documents/stage-1`);
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        code: 'NOT_JSON_SAFE',
+        message: expect.stringMatching(/document response.*outline.*Date/i),
+      },
+    });
+  });
+
+  test('maps missing required parents to typed 404 errors with browser wording', async () => {
+    const { client } = makeHarness();
+    const failure = client.putStage('ghost', {
+      id: 'ghost',
+      name: 'Ghost',
+      createdAt: 1,
+      updatedAt: 2,
+    });
+    await expect(failure).rejects.toBeInstanceOf(HttpDocumentStoreError);
+    await expect(failure).rejects.toMatchObject({ status: 404, code: 'DOCUMENT_NOT_FOUND' });
+    await expect(failure).rejects.toThrow(/missing document/);
+  });
+
+  test.each([
+    [
+      'putStage',
+      (client: HttpDocumentStore) =>
+        client.putStage('stage-1', {
+          id: 'stage-1',
+          name: 'Stale update',
+          createdAt: 1,
+          updatedAt: 2,
+        }),
+    ],
+    [
+      'putScene',
+      (client: HttpDocumentStore) =>
+        client.putScene('stage-1', slideScene('stage-1', 'scene-c', 2)),
+    ],
+    ['deleteScene', (client: HttpDocumentStore) => client.deleteScene('stage-1', 'scene-a')],
+  ])('maps unversioned %s to 400 VALIDATION_FAILED', async (_operation, write) => {
+    const { client, seedStoredVersion } = makeHarness();
+    await client.saveDocument(makeDocument());
+    await seedStoredVersion('stage-1', undefined);
+
+    await expect(write(client)).rejects.toMatchObject({
+      status: 400,
+      code: 'VALIDATION_FAILED',
+    });
+  });
+
+  test('maps a future-version save to FUTURE_VERSION without overwriting current data', async () => {
+    const { client } = makeHarness();
+    await client.saveDocument(makeDocument());
+    const future = makeDocument();
+    future.dslVersion = '99.0.0';
+    future.stage.name = 'Future';
+
+    const failure = client.saveDocument(future);
+    await expect(failure).rejects.toBeInstanceOf(DocumentVersionError);
+    await expect(failure).rejects.toMatchObject({
+      stageId: 'stage-1',
+      kind: 'future',
+      storedVersion: '99.0.0',
+    });
+    await expect(failure).rejects.toThrow(
+      `@openmaic/storage: refusing to save document "stage-1" — it was written at DSL version ` +
+        `"99.0.0", newer than this client's`,
+    );
+    expect((await client.loadDocument('stage-1'))!.stage.name).toBe('Intro Course');
+  });
+
+  test('rematerializes a typed future-version error classified from the backing store', async () => {
+    const { client, seedStoredVersion } = makeHarness();
+    await client.saveDocument(makeDocument());
+    await seedStoredVersion('stage-1', '99.0.0');
+    const replacement = makeDocument();
+    replacement.stage.name = 'Old Client Overwrite';
+
+    const failure = client.saveDocument(replacement);
+    await expect(failure).rejects.toBeInstanceOf(DocumentVersionError);
+    await expect(failure).rejects.toMatchObject({
+      stageId: 'stage-1',
+      kind: 'future',
+      storedVersion: '99.0.0',
+    });
+    await expect(failure).rejects.toThrow(/refusing to overwrite document/);
+  });
+
+  test('client-side validators fail before fetch', async () => {
+    let calls = 0;
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: async () => {
+        calls += 1;
+        return new Response(null, { status: 204 });
+      },
+    });
+    const bad = makeDocument();
+    delete (bad.stage as { name?: string }).name;
+    await expect(client.saveDocument(bad)).rejects.toThrow(/invalid stage/);
+    expect(calls).toBe(0);
+  });
+
+  test('retains structured validator details on HttpDocumentStoreError', async () => {
+    const details = [
+      { path: '/name', message: 'name is invalid' },
+      { path: '/updatedAt', message: 'updatedAt is invalid' },
+    ];
+    const { client } = makeHarness(() => true, {
+      validateStage: () => ({ valid: false, errors: details }),
+    });
+
+    await expect(
+      client.putStage('stage-1', {
+        id: 'stage-1',
+        name: 'Rejected by server validator',
+        createdAt: 1,
+        updatedAt: 2,
+      }),
+    ).rejects.toMatchObject({
+      status: 400,
+      code: 'VALIDATION_FAILED',
+      details,
+    });
+  });
+
+  test('sends a row write with keepalive only when the caller asks for it', async () => {
+    const seen: Array<{ method: string; path: string; keepalive: boolean | undefined }> = [];
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: async (input, init) => {
+        seen.push({
+          method: init?.method ?? 'GET',
+          path: new URL(String(input)).pathname,
+          keepalive: init?.keepalive,
+        });
+        return new Response(null, { status: 204 });
+      },
+    });
+    const document = makeDocument();
+    const scene = document.scenes[0]!;
+
+    await client.putScene(document.stage.id, scene, { keepalive: true });
+    await client.putStage(document.stage.id, document.stage, { keepalive: true });
+    await client.putScene(document.stage.id, scene);
+    await client.putStage(document.stage.id, document.stage);
+
+    expect(seen).toEqual([
+      {
+        method: 'PUT',
+        path: `/documents/${document.stage.id}/scenes/${scene.id}`,
+        keepalive: true,
+      },
+      { method: 'PUT', path: `/documents/${document.stage.id}/stage`, keepalive: true },
+      {
+        method: 'PUT',
+        path: `/documents/${document.stage.id}/scenes/${scene.id}`,
+        keepalive: undefined,
+      },
+      { method: 'PUT', path: `/documents/${document.stage.id}/stage`, keepalive: undefined },
+    ]);
+  });
+
+  // The autosave keeps at most one save in flight and starts the next one only
+  // once that promise settles. A request that never settles therefore strands
+  // every later save for the life of the page — silently, because the store
+  // still reports the work as pending. The deadline is what turns that into an
+  // ordinary failure the backoff can retry.
+  test('rejects a stalled request at the deadline instead of holding its caller forever', async () => {
+    let aborted = false;
+    const stalledFetch = ((_input: string | URL | Request, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(init.signal?.reason ?? new Error('aborted'));
+        });
+      });
+    }) as typeof fetch;
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: stalledFetch,
+      requestTimeoutMs: 30,
+    });
+
+    const started = Date.now();
+    await expect(client.saveDocument(makeDocument())).rejects.toMatchObject({
+      name: 'HttpDocumentStoreError',
+      status: 0,
+      code: 'HTTP_REQUEST_TIMEOUT',
+    });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(aborted).toBe(true);
+  });
+
+  test('disarms the deadline once a request settles, so it cannot abort a completed one', async () => {
+    let signal: AbortSignal | undefined;
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: async (_input, init) => {
+        signal = init?.signal ?? undefined;
+        return new Response(JSON.stringify([]), { status: 200 });
+      },
+      requestTimeoutMs: 30,
+    });
+
+    await expect(client.listDocuments()).resolves.toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(signal?.aborted).toBe(false);
+  });
+
+  test('a non-positive requestTimeoutMs leaves the wait unbounded', async () => {
+    let signal: AbortSignal | undefined;
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: (_input, init) => {
+        signal = init?.signal ?? undefined;
+        return new Promise<Response>(() => {});
+      },
+      requestTimeoutMs: 0,
+    });
+
+    void client.listDocuments().catch(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(signal).toBeUndefined();
+  });
+
+  // The deadline spans sending the body, so a budget that ignored the body
+  // would abort a large save on a slow link on every attempt — and because
+  // every retry meets the same budget, such a save could never complete at
+  // all, which is worse than the unbounded wait the deadline replaces.
+  const slowFetch = (
+    onRequest?: (init: RequestInit | undefined) => void,
+    delayMs = 300,
+  ): typeof fetch =>
+    ((_input: string | URL | Request, init?: RequestInit) => {
+      onRequest?.(init);
+      // Answers after `delayMs` unless the deadline aborts it first, the way a
+      // real fetch does. A fake that ignored the signal would prove nothing.
+      return new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(new Response(null, { status: 204 })), delayMs);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(init.signal?.reason ?? new Error('aborted'));
+        });
+      });
+    }) as typeof fetch;
+
+  test('lets a large, slow request finish when its body earns the extra time', async () => {
+    // ~200 KiB at the assumed 100 KiB/s earns roughly 2s on top of the 50ms
+    // floor, so a fetch answering in 300ms is slow, not stalled.
+    const document = makeDocument();
+    document.scenes[0] = slideScene('stage-1', 'scene-a', 0, 'x'.repeat(200 * 1024));
+    let bodyLength = 0;
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: slowFetch((init) => {
+        bodyLength = typeof init?.body === 'string' ? init.body.length : 0;
+      }),
+      requestTimeoutMs: 50,
+    });
+
+    await expect(client.saveDocument(document)).resolves.toBeUndefined();
+    // Guard the premise: without a body this large the test would pass for the
+    // wrong reason, by never coming near the deadline.
+    expect(bodyLength).toBeGreaterThan(200 * 1024);
+  });
+
+  test('aborts the same slow request when its body is too small to earn it', async () => {
+    const client = new HttpDocumentStore({
+      baseUrl: BASE_URL,
+      fetch: slowFetch(),
+      requestTimeoutMs: 50,
+    });
+
+    await expect(client.saveDocument(makeDocument())).rejects.toMatchObject({
+      name: 'HttpDocumentStoreError',
+      status: 0,
+      code: 'HTTP_REQUEST_TIMEOUT',
+    });
+  });
+});

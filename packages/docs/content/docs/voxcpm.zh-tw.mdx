@@ -1,0 +1,86 @@
+---
+title: VoxCPM2
+description: 自託管 TTS 與聲音複製。後端選擇、設定和聲音管理。
+---
+
+[VoxCPM2](https://github.com/OpenBMB/VoxCPM) 是 OpenBMB 開源的 TTS 模型，支援聲音複製。OpenMAIC 內建適配器，只要在自己的機器上執行 VoxCPM 即可對接。
+
+## 什麼時候使用 VoxCPM2
+
+- 想要穩定、免費的 TTS，沒有字元計費。
+- 想要聲音複製（每個 Agent 都能從一段短參考音訊生成自己的音色）。
+- 在本機部署或離線環境中執行。
+
+如果只需要一個預設音色，使用內建的 **Doubao** 或 **OpenAI 相容** 供應商會更簡單。請見[設定 → TTS 供應商](./configuration.mdx#tts-供應商)。
+
+## 1. 啟動 VoxCPM 後端
+
+OpenMAIC 支援三種部署形態，三種都使用同一個 OpenMAIC 適配器；在 `openmaic.yml` 中透過供應商的 `options.backend` 選擇你執行的那一種（見第 2 步）。
+
+| 後端           | 端點               | 適用場景                                     |
+| -------------- | ------------------ | -------------------------------------------- |
+| **vLLM-Omni**  | `/v1/audio/speech` | OpenAI 相容的語音端點，適合 GPU 伺服器。     |
+| **Python API** | `/tts/upload`      | VoxCPM 官方 Python runtime（透過 FastAPI）。 |
+| **Nano-vLLM**  | `/generate`        | 輕量的 Nano-vLLM FastAPI 部署，適合小型機器。 |
+
+每種後端的啟動方式請見 [VoxCPM 儲存庫](https://github.com/OpenBMB/VoxCPM)。典型的本機快速啟動方式如下：
+
+```bash
+# vLLM-Omni 範例
+pip install vllm
+python -m vllm_omni.server --model openbmb/VoxCPM2 --port 8000
+# 端點位於 http://localhost:8000/v1
+```
+
+## 2. 讓 OpenMAIC 對接它
+
+VoxCPM2 執行在你自己的網路中，因此它的端點由部署設定，工作區不能在 **設定 → 模型服務** 中新增它。請在 `openmaic.yml` 中宣告它，用 `options.backend` 選擇後端，並指派給 `tts` 插槽，不需要 API key：
+
+```yaml title="openmaic.yml"
+providers:
+  voxcpm:
+    preset: voxcpm-tts
+    baseUrl: http://localhost:8000/v1
+    options:
+      backend: vllm-omni          # vllm-omni（預設）| python-api | nano-vllm
+
+slots:
+  tts: voxcpm
+```
+
+供應商的 `options.backend` 適用於 `tts` 插槽上的所有請求。聲音註冊只在 `vllm-omni` 後端可用；使用 `python-api` 和 `nano-vllm` 時，聲音提示會隨每次請求傳送。
+
+沒有 `openmaic.yml` 時，舊版變數可以設定端點，但無法選擇後端；如需 `python-api` 或 `nano-vllm`，請使用 `openmaic.yml`：
+
+```bash
+TTS_VOXCPM_BASE_URL=http://localhost:8000/v1
+```
+
+由於該供應商由伺服器端管理，它的端點可以位於內網而不需要 `ALLOW_LOCAL_NETWORKS`，使用者也無法覆寫它。
+
+## 3. 聲音管理
+
+先把 VoxCPM2 指派給 `tts` 插槽（第 2 步），再開啟 **設定 → 模型服務 → 語音合成 → VoxCPM2**。只有當 `tts` 插槽解析到 `voxcpm-tts` 供應商時才會出現 VoxCPM 音色管理，其中有三種聲音模式。
+
+### Auto Voice（預設）
+
+OpenMAIC 會在合成時根據每個 Agent 的人設動態生成 voice prompt。無需任何設定；不變更任何項目就是此模式。
+
+### Prompt voice（提示詞音色）
+
+使用自然語言描述音色。生成後可以重複使用，並分配給任意 Agent。
+
+> _範例：「溫暖的女老師聲音，平穩而鼓勵，中音域，吐字清晰。」_
+
+### Clone voice（聲音複製）
+
+上傳一段短參考音訊（≤ 60 秒，≤ 10 MB），或直接在瀏覽器中錄音。音訊會儲存在 IndexedDB 中，並在每次合成時傳送至後端。
+
+## 疑難排解
+
+| 現象                     | 可能原因                                                        |
+| ------------------------ | --------------------------------------------------------------- |
+| 請求回傳 404 | `options.backend` 與你執行的後端不一致，請對照第 1 步的端點表。 |
+| 第一次複製請求要等 ~30s  | 後端冷啟動；後續複製會重用已暖機的 runtime。                     |
+| 音訊說到一半就中斷       | 後端輸出 token 數受限，請調高 `--max-tokens` 或對應的 VoxCPM 設定。 |
+| 401 / 403                | 為不需要 key 的後端設定了 `TTS_VOXCPM_API_KEY`，留空即可。       |

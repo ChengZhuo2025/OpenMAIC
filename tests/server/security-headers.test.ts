@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { NextConfig } from 'next';
+import { PHASE_DEVELOPMENT_SERVER } from 'next/constants';
 
 async function loadConfig(): Promise<NextConfig> {
   vi.resetModules();
   const mod = await import('@/next.config');
-  return mod.default;
+  return mod.default(PHASE_DEVELOPMENT_SERVER);
 }
 
 describe('Security response headers', () => {
@@ -78,5 +79,13 @@ describe('Security response headers', () => {
         value: "frame-ancestors 'self' https://a.example.com https://b.example.com",
       });
     });
+  });
+
+  it('lets browsers reuse provider logos instead of revalidating each one', async () => {
+    const headerGroups = await (await loadConfig()).headers!();
+    const logos = headerGroups.find((g) => g.source === '/logos/:path*');
+    const cache = logos?.headers.find((h) => h.key === 'Cache-Control')?.value ?? '';
+    expect(cache).toMatch(/max-age=[1-9]/);
+    expect(cache).not.toContain('immutable');
   });
 });

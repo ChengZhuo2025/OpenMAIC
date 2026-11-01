@@ -2,13 +2,14 @@
 
 import { useEffect, useRef, useMemo } from 'react';
 import tinycolor from 'tinycolor2';
-import type { ChartData, ChartOptions, ChartType } from '@/lib/types/slides';
+import type { ChartData, ChartOptions, ChartType } from '@openmaic/dsl';
 import { getChartOption } from './chartOption';
 
 import * as echarts from 'echarts/core';
 import { BarChart, LineChart, PieChart, ScatterChart, RadarChart } from 'echarts/charts';
 import { LegendComponent } from 'echarts/components';
 import { SVGRenderer } from 'echarts/renderers';
+import * as chartFeatures from 'echarts/features';
 
 echarts.use([
   BarChart,
@@ -19,6 +20,8 @@ echarts.use([
   LegendComponent,
   SVGRenderer,
 ]);
+// ECharts 6 makes the ECharts 5 containLabel layout an opt-in feature.
+if (chartFeatures.LegacyGridContainLabel) echarts.use(chartFeatures.LegacyGridContainLabel);
 
 interface ChartProps {
   width: number;

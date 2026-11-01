@@ -1,0 +1,152 @@
+/**
+ * The retry affordances spend the same budget the resume effect does, so they
+ * answer to the same permission. These tests cover the shared predicate, the
+ * withdrawal of the retry affordance from a resolution, and the refusal inside
+ * the function that affordance calls.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { setModelSettingsViewForTests } from '../helpers/model-settings-view';
+
+const mocks = vi.hoisted(() => ({
+  mediaDelete: vi.fn(),
+  mediaGet: vi.fn(),
+}));
+
+vi.mock('@/lib/device-storage/database', () => ({
+  mediaFileKey: (stageId: string, ref: string) => `${stageId}:${ref}`,
+  db: {
+    mediaFiles: {
+      put: vi.fn(),
+      delete: mocks.mediaDelete,
+      get: mocks.mediaGet,
+      where: () => ({ equals: () => ({ toArray: async () => [] }) }),
+    },
+  },
+}));
+
+import {
+  mayGenerateForStage,
+  noteStageGenerationOwnership,
+  resetGenerationPermissionsForTests,
+} from '@/lib/classroom/generation-permission';
+import { withGenerationPermission } from '@/lib/media/resolve-media-ref';
+import { retryMediaTask } from '@/lib/media/media-orchestrator';
+import { useMediaGenerationStore } from '@/lib/store/media-generation';
+
+const stageId = 'permission-stage';
+
+describe('shared generation permission', () => {
+  beforeEach(() => {
+    resetGenerationPermissionsForTests();
+  });
+
+  it('refuses a course nobody has recorded an answer for', () => {
+    expect(mayGenerateForStage(stageId)).toBe(false);
+  });
+
+  it('refuses a course with no id at all', () => {
+    expect(mayGenerateForStage(undefined)).toBe(false);
+  });
+
+  it('answers per course, so one course cannot speak for another', () => {
+    noteStageGenerationOwnership(stageId, 'owner');
+    expect(mayGenerateForStage(stageId)).toBe(true);
+    expect(mayGenerateForStage('another-stage')).toBe(false);
+  });
+
+  it.each(['not-owner', 'ownerless', 'unresolved'] as const)('refuses %s', (ownership) => {
+    noteStageGenerationOwnership(stageId, ownership);
+    expect(mayGenerateForStage(stageId)).toBe(false);
+  });
+});
+
+describe('withdrawing the retry affordance', () => {
+  it('clears retryability from a failed resolution', () => {
+    expect(withGenerationPermission({ kind: 'failed', retryable: true }, false)).toEqual({
+      kind: 'failed',
+      retryable: false,
+    });
+  });
+
+  it('clears retryability from a last-known-bytes resolution', () => {
+    expect(
+      withGenerationPermission({ kind: 'url', url: 'blob:x', retryable: true }, false),
+    ).toEqual({ kind: 'url', url: 'blob:x', retryable: false });
+  });
+
+  it('leaves the resolution untouched when generation is permitted', () => {
+    const state = { kind: 'failed', retryable: true } as const;
+    expect(withGenerationPermission(state, true)).toBe(state);
+  });
+
+  it('leaves a resolution with no retry affordance untouched', () => {
+    const state = { kind: 'pending' } as const;
+    expect(withGenerationPermission(state, false)).toBe(state);
+  });
+});
+
+describe('retryMediaTask honours the same permission', () => {
+  beforeEach(() => {
+    resetGenerationPermissionsForTests();
+    mocks.mediaDelete.mockReset().mockResolvedValue(undefined);
+    mocks.mediaGet.mockReset().mockResolvedValue(undefined);
+    // The workspace's image and video slots resolve to a provider.
+    setModelSettingsViewForTests({
+      image: { registryId: 'seedream' },
+      video: { registryId: 'seedance' },
+    });
+    useMediaGenerationStore.setState({
+      tasks: {
+        gen_img_x: {
+          elementId: 'gen_img_x',
+          type: 'image',
+          status: 'failed',
+          prompt: 'A diagram',
+          params: {},
+          error: 'transient',
+          retryCount: 0,
+          stageId,
+        },
+      },
+    });
+  });
+
+  it('does not touch the task or its cache row for a viewer', async () => {
+    await retryMediaTask('gen_img_x');
+
+    expect(mocks.mediaDelete).not.toHaveBeenCalled();
+    expect(useMediaGenerationStore.getState().tasks.gen_img_x?.status).toBe('failed');
+  });
+
+  it('proceeds once the sidecar names this viewer the owner', async () => {
+    noteStageGenerationOwnership(stageId, 'owner');
+    const fetchMock = vi.fn().mockRejectedValue(new Error('provider unreachable'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await retryMediaTask('gen_img_x');
+
+    expect(mocks.mediaDelete).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
+  it('leaves the task alone when the model settings cannot be read', async () => {
+    noteStageGenerationOwnership(stageId, 'owner');
+    // Nothing read yet, and every read fails.
+    setModelSettingsViewForTests(null);
+    const fetchMock = vi.fn().mockRejectedValue(new TypeError('offline'));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await retryMediaTask('gen_img_x');
+
+    // Not marked "generation disabled": unknown settings are no refusal.
+    expect(useMediaGenerationStore.getState().tasks.gen_img_x).toMatchObject({
+      status: 'failed',
+      error: 'transient',
+    });
+    expect(mocks.mediaDelete).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls.every(([url]) => url === '/api/model-config')).toBe(true);
+    vi.unstubAllGlobals();
+  });
+});

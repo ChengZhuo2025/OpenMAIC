@@ -24,8 +24,9 @@ To avoid duplicate effort, please **comment on an issue** to claim it before you
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) >= 20.9.0
+- [Node.js](https://nodejs.org/) >= 22.19.0
 - [pnpm](https://pnpm.io/) (latest)
+- [Docker](https://docs.docker.com/get-docker/) for the local PostgreSQL database (`pnpm db:up`), or any PostgreSQL 16 you can point `DATABASE_URL` at
 - A copy of `.env.local` — see [`.env.example`](.env.example) for reference
 
 ## Getting Started
@@ -42,9 +43,23 @@ pnpm install
 cp .env.example .env.local
 # Edit .env.local with your API keys
 
-# Start the development server
+# Start the local development database (a separate PostgreSQL on 127.0.0.1:5432,
+# shared by every checkout on this machine;
+# set OPENMAIC_DB_PORT for another port), then uncomment the local
+# DATABASE_URL line in .env.local:
+#   DATABASE_URL=postgres://openmaic:openmaic-dev@127.0.0.1:5432/openmaic
+pnpm db:up
+
+# Start the development server (it refuses to start without DATABASE_URL)
 pnpm dev
 ```
+
+`pnpm db:down` stops the development database and keeps its data. The E2E
+suite (`pnpm test:e2e`) also needs `DATABASE_URL`.
+
+`pnpm dev` also builds the standalone HTML player (`lib/standalone-player`,
+used by "Export as HTML") once at startup. It is not rebuilt on change: after
+editing the player, run `pnpm build:standalone-player` before exporting again.
 
 ## Development Workflow
 
@@ -59,6 +74,15 @@ pnpm dev
 3. Make your changes and **test locally**.
 4. Run **all CI checks** before committing (see below).
 5. Open a **Pull Request** against `main`.
+
+### Environment Variable Changes
+
+When adding or renaming an operator-facing environment variable, update
+[`.env.example`](.env.example) in the same PR. Document whether it is optional,
+its safe default or example value, and whether it is read at build time or
+runtime. Variables used only by tests, CI, or internal development scripts do
+not need to be added to the template, but their owning file or documentation
+must make that limited scope clear.
 
 ## Before You Submit a PR
 
@@ -96,6 +120,17 @@ If you have not completed local verification, keep your PR in **Draft** status. 
 - **Ensure CI passes** before requesting review
 - **All UI text must be internationalized (i18n)** — do not hardcode user-facing strings
 
+### Review Threads
+
+Every non-draft PR gets an automated Codex review on each push; a draft is not reviewed until it is marked ready. The review follows the rules in [AGENTS.md](AGENTS.md). Its findings are advisory, and a maintainer makes the final review and merge decision.
+
+`main` only accepts a PR once every review thread is resolved, so handling the threads is part of getting a PR merged:
+
+- **Answer every thread before resolving it.** Either fix the finding and reply with the commit, or reply with why it stays (tracked in another issue or PR, or a deliberate trade-off). Do not resolve a thread silently.
+- **Outdated threads too.** When a later change removes or rewrites the code a thread points at, reply briefly to say so and resolve it.
+- **Keep the PR in draft while it is still changing.** Every push to a ready PR triggers a new review and dismisses earlier approvals; mark it ready once the changes are in.
+- **A stuck review does not block.** If the Codex review fails, or keeps running for about 20 minutes on the same commit, the maintainer decides from CI and their own review.
+
 ## Commit Message Convention
 
 We follow [Conventional Commits](https://www.conventionalcommits.org/):
@@ -118,6 +153,40 @@ fix(whiteboard): prevent canvas from resetting on window resize
 docs: add CONTRIBUTING.md
 ```
 
+## Changing a Published Package
+
+The `@openmaic` packages listed in [`scripts/openmaic-packages.mjs`](scripts/openmaic-packages.mjs) are published to npm. Anything that ships inside one of those tarballs is under version control in the literal sense — the version number on npm has to keep meaning "this exact source".
+
+**If your PR changes a publishable file in one of those packages, bump that package's `version` in its `package.json` in the same PR.** CI enforces this, and without the bump you will see:
+
+```
+<package>: publishable package inputs changed but version did not increase
+```
+
+What counts as publishable: everything under the package directory except files that never reach the tarball, such as `docs/`, `test/`, and `vitest.config.ts`. Editing only those needs no bump. The exact set lives in `scripts/check-package-version-bumps.mjs`.
+
+Choosing the number is a [semver](https://semver.org/) judgement, and it is yours to make rather than something CI can infer:
+
+- **patch** — a fix that changes no documented behaviour
+- **minor** — new behaviour that existing consumers can ignore
+- **major** — anything an existing consumer must react to
+
+For packages below `1.0.0`, a **minor** bump signals a breaking change and a **patch** bump signals a compatible change, following common 0.x semver practice; the **major** rule applies from `1.0.0`.
+
+Be deliberate with `@openmaic/dsl`. It is the contract the other packages and downstream deployments validate against, so a change that narrows what an existing document may contain is a breaking change even when the diff looks small.
+
+You never publish anything yourself. Once your PR is merged, a version that is not yet on the registry is released automatically, and a `@openmaic/<name>@<version>` tag is written afterwards to record it. That tag is a marker, not a trigger: pushing one does not release anything.
+
+## App Releases
+
+App versions (the `vX.Y.Z` tags and GitHub Releases) say what a release is about. They are separate from the npm package rules above.
+
+- **Minor (`x.Y.0`)** — a themed release, titled by its theme (1.0.0 *Build courses with an agent*, 1.1.0 *Classroom chat on an agent loop*, 1.2.0 *Server-first*). Large migrations go through `-rc.N` pre-releases first.
+- **Patch (`x.y.Z`)** — cut from `main` with whatever has merged since the last release: fixes, security, and features alike, typically every one to three weeks. A patch may carry a breaking change when one is needed (tightening a default, retiring a superseded path); it is listed first under **Breaking Changes** with upgrade steps.
+- While `main` is in a minor's release-candidate cycle, security fixes for the current line ship as patches from a `release/x.y.x` branch.
+
+Every release has a `CHANGELOG.md` section, and the GitHub Release title names its headline.
+
 ## AI-Assisted PRs 🤖
 
 PRs built with AI tools (Codex, Claude, Cursor, etc.) are welcome! We just ask for transparency and self-review:
@@ -125,6 +194,8 @@ PRs built with AI tools (Codex, Claude, Cursor, etc.) are welcome! We just ask f
 - **Mark it** — note in the PR title or description that the PR is AI-assisted
 - **AI-review your own code first** — before requesting maintainer review, run an AI code review (e.g. Claude, Codex, Copilot) on your changes and address the findings. This is **required** for AI-assisted PRs to avoid dumping large amounts of unreviewed generated code on maintainers.
 - **You are responsible for what you submit** — understand the code, not just the prompt.
+
+Every non-draft PR also gets an automated Codex review on each push; see [Review Threads](#review-threads) for how to handle its findings.
 
 AI-assisted PRs are held to the same quality standard as any other PR. Community members are also encouraged to leave constructive feedback on any PR — peer review helps everyone improve.
 
@@ -134,10 +205,9 @@ AI-assisted PRs are held to the same quality standard as any other PR. Community
 OpenMAIC/
 ├── app/              # Next.js app router pages and API routes
 ├── components/       # React components
-├── lib/              # Shared utilities and core logic
+├── lib/              # Shared utilities and core logic (i18n in lib/i18n/locales/)
 ├── packages/         # Internal packages (mathml2omml, pptxgenjs)
 ├── public/           # Static assets
-├── messages/         # i18n translation files
 └── .github/          # Issue templates, PR template, CI workflows
 ```
 
@@ -160,4 +230,4 @@ Please report security vulnerabilities through [GitHub Security Advisories](http
 
 ## License
 
-By contributing to OpenMAIC, you agree that your contributions will be licensed under the [AGPL-3.0 License](LICENSE).
+By contributing to OpenMAIC, you agree that your contributions will be licensed under the [MIT License](LICENSE).

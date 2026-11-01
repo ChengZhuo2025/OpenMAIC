@@ -1,0 +1,215 @@
+'use client';
+
+/**
+ * Provider-neutral client orchestrator for the auto-voice register-once flow.
+ *
+ * Given a provider id + voice design, it resolves a deterministic voice id,
+ * ensures the voice is registered on the backend via `POST /api/generate/voice`
+ * (which dispatches to the provider's adapter), and caches the reference clip
+ * in IndexedDB so a GC'd voice can be re-registered. Callers decide *whether*
+ * their provider supports registration; this module is provider-agnostic.
+ */
+
+import { db } from '@/lib/device-storage/database';
+import { getDeterministicVoiceId, type VoiceDesign } from '@/lib/audio/voice-design';
+import { clearVoiceBindingUnavailable } from '@/lib/audio/unavailable-voice-bindings';
+import { effectiveTarget } from '@/lib/model-settings/capabilities';
+import { modelSettingsClient } from '@/lib/model-settings/client';
+
+/**
+ * The model a voice is registered for. It derives the deterministic voice id
+ * and keys the session memo; it is not sent: the server registers with the
+ * provider and model the `tts` slot resolves to.
+ */
+export interface VoiceRegistrationRequestConfig {
+  ttsModelId?: string;
+}
+
+export interface UserVoiceRegistrationParams {
+  name: string;
+  referenceAudio: Blob;
+  refText: string;
+}
+
+function base64ToBlob(base64: string, mimeType?: string): Blob {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mimeType || 'audio/wav' });
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('Failed to read reference audio'));
+    reader.onload = () => {
+      const result = typeof reader.result === 'string' ? reader.result : '';
+      const commaIndex = result.indexOf(',');
+      resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+    };
+    reader.readAsDataURL(blob);
+  });
+}
+
+/**
+ * Register a user-provided sample with the `tts` slot's provider (`providerId`
+ * is the provider the voice is recorded for locally) and return the provider's
+ * authoritative voice id.
+ */
+export async function registerVoiceFromReference(
+  providerId: string,
+  params: UserVoiceRegistrationParams,
+): Promise<string> {
+  const referenceAudioBase64 = await blobToBase64(params.referenceAudio);
+  const res = await fetch('/api/generate/voice', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    // The tts slot names the provider on the server.
+    body: JSON.stringify({
+      voiceId: params.name.trim(),
+      referenceAudioBase64,
+      mimeType: params.referenceAudio.type || 'audio/wav',
+      refText: params.refText,
+    }),
+  });
+  const data = (await res.json().catch(() => ({}))) as { voiceId?: unknown; error?: unknown };
+  if (!res.ok) {
+    throw new Error(typeof data.error === 'string' ? data.error : 'Voice registration failed');
+  }
+  const voiceId = typeof data.voiceId === 'string' ? data.voiceId.trim() : '';
+  if (!voiceId) throw new Error('Voice registration returned no voice id');
+  clearVoiceBindingUnavailable({ providerId, voiceId: params.name.trim() });
+  clearVoiceBindingUnavailable({ providerId, voiceId });
+  return voiceId;
+}
+
+/** Request provider-side deletion. Returns false so callers can still remove local state. */
+export async function deleteRegisteredVoice(providerId: string, voiceId: string): Promise<boolean> {
+  try {
+    const res = await fetch('/api/generate/voice', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ voiceId, action: 'delete' }),
+    });
+    const data = (await res.json().catch(() => ({}))) as { vendorDeleted?: unknown };
+    return res.ok && data.vendorDeleted === true;
+  } catch {
+    return false;
+  }
+}
+
+// Confirmed-registered + in-flight memos, keyed by (voiceId, model) within the
+// provider the workspace's `tts` slot resolves to. The same voice id may be
+// unregistered on another backend serving the same model, so the memo is
+// scoped to that provider (its id, registry entry and endpoint) and to the
+// settings revision: switching the slot, or editing its provider, registers
+// again (the server's existence check makes that cheap).
+const registeredThisSession = new Set<string>();
+const inFlight = new Map<string, Promise<string | undefined>>();
+
+/** The TTS provider registrations are made with, as far as the page knows it. */
+function registrationScope(): string {
+  const view = modelSettingsClient.getState().view;
+  const tts = effectiveTarget(view, 'tts');
+  return JSON.stringify([
+    tts?.providerId ?? '',
+    tts?.registryId ?? '',
+    tts?.baseUrl ?? '',
+    tts?.options ?? null,
+    view?.revision ?? null,
+  ]);
+}
+
+function memoKeyFor(
+  voiceId: string,
+  request: VoiceRegistrationRequestConfig,
+  scope = registrationScope(),
+): string {
+  return `${scope}::${voiceId}::${request.ttsModelId ?? ''}`;
+}
+
+async function getCachedClip(
+  voiceId: string,
+): Promise<{ base64: string; mimeType: string } | undefined> {
+  const row = await db.autoVoiceCache.get(voiceId);
+  if (!row) return undefined;
+  return { base64: await blobToBase64(row.referenceAudio), mimeType: row.mimeType };
+}
+
+/**
+ * Ensure the agent's deterministic auto voice is registered for `providerId`,
+ * returning its voice id (or undefined when unavailable, so callers fall back
+ * to the inline voice-design prompt). Lazy + idempotent: memoized per session,
+ * reference clip cached in IndexedDB. register-on-invalid is handled by the
+ * endpoint's existence check, which re-registers a GC'd voice from the clip.
+ */
+export async function ensureRegisteredVoice(
+  providerId: string,
+  params: { voiceDesign?: VoiceDesign; language?: string },
+  request: VoiceRegistrationRequestConfig,
+): Promise<string | undefined> {
+  if (!params.voiceDesign) return undefined;
+
+  const voiceId = await getDeterministicVoiceId(params.voiceDesign, {
+    providerId,
+    model: request.ttsModelId,
+  });
+  const scope = registrationScope();
+  const memoKey = memoKeyFor(voiceId, request, scope);
+  if (registeredThisSession.has(memoKey)) return voiceId;
+
+  // Coalesce concurrent calls for the same (voiceId, backend) into one request.
+  const existing = inFlight.get(memoKey);
+  if (existing) return existing;
+
+  const promise = registerOnce(providerId, voiceId, scope, params, request).finally(() =>
+    inFlight.delete(memoKey),
+  );
+  inFlight.set(memoKey, promise);
+  return promise;
+}
+
+async function registerOnce(
+  providerId: string,
+  voiceId: string,
+  scope: string,
+  params: { voiceDesign?: VoiceDesign; language?: string },
+  request: VoiceRegistrationRequestConfig,
+): Promise<string | undefined> {
+  const memoKey = memoKeyFor(voiceId, request, scope);
+  const cached = await getCachedClip(voiceId);
+  const res = await fetch('/api/generate/voice', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      voiceId,
+      descriptor: params.voiceDesign,
+      language: params.language,
+      referenceAudioBase64: cached?.base64,
+      mimeType: cached?.mimeType,
+    }),
+  });
+  if (!res.ok) return undefined; // graceful fallback to the inline prompt path
+
+  const data = (await res.json().catch(() => ({}))) as {
+    voiceId?: string;
+    referenceAudioBase64?: string;
+    mimeType?: string;
+  };
+  if (data.referenceAudioBase64 && !cached) {
+    await db.autoVoiceCache.put({
+      voiceId,
+      referenceAudio: base64ToBlob(data.referenceAudioBase64, data.mimeType),
+      mimeType: data.mimeType || 'audio/wav',
+      updatedAt: Date.now(),
+    });
+  }
+  const registeredVoiceId = data.voiceId?.trim() || voiceId;
+  clearVoiceBindingUnavailable({ providerId, voiceId });
+  clearVoiceBindingUnavailable({ providerId, voiceId: registeredVoiceId });
+  registeredThisSession.add(memoKey);
+  if (registeredVoiceId !== voiceId) {
+    registeredThisSession.add(memoKeyFor(registeredVoiceId, request, scope));
+  }
+  return registeredVoiceId;
+}

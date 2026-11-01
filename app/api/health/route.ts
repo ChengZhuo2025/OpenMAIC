@@ -1,10 +1,6 @@
 import { apiSuccess } from '@/lib/server/api-response';
-import {
-  getServerWebSearchProviders,
-  getServerImageProviders,
-  getServerVideoProviders,
-  getServerTTSProviders,
-} from '@/lib/server/provider-config';
+import { resolveServerGenerationCapabilities } from '@/lib/server/generation-capabilities';
+import { getParallelSceneConcurrency } from '@/lib/server/provider-config';
 
 const version = process.env.npm_package_version || '0.1.0';
 
@@ -12,11 +8,9 @@ export async function GET() {
   return apiSuccess({
     status: 'ok',
     version,
-    capabilities: {
-      webSearch: Object.keys(getServerWebSearchProviders()).length > 0,
-      imageGeneration: Object.keys(getServerImageProviders()).length > 0,
-      videoGeneration: Object.keys(getServerVideoProviders()).length > 0,
-      tts: Object.keys(getServerTTSProviders()).length > 0,
-    },
+    accessCodeConfigured: Boolean(process.env.ACCESS_CODE),
+    capabilities: await resolveServerGenerationCapabilities(),
+    // How many scenes the browser may generate at once (PARALLEL_SCENE_CONCURRENCY).
+    generation: { parallelSceneConcurrency: getParallelSceneConcurrency() },
   });
 }

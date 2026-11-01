@@ -53,6 +53,18 @@ export interface ParsedPdfContent {
       description?: string;
       width?: number;
       height?: number;
+      /**
+       * Pool asset id of the image bytes. Present only on cache-rebuilt
+       * results in asset-id mode (RFC #1153 part 2 C): a server-backed cache
+       * hit names the image's pool asset instead of materializing its bytes.
+       */
+      assetId?: string;
+      /**
+       * The path the provider's own text uses for this image, when it has
+       * one (MinerU's markdown names images by their file, `images/<file>`),
+       * so the text's references can be matched to the image.
+       */
+      path?: string;
     }>;
     [key: string]: unknown;
   };

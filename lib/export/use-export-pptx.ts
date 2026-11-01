@@ -2,28 +2,57 @@
 
 import { useState, useCallback, useRef } from 'react';
 import pptxgen from 'pptxgenjs';
+import { validateShapeGeometry, RENDER_PATH_LIMITS, shapeToTextFallback } from '@openmaic/geometry';
 import tinycolor from 'tinycolor2';
 import { saveAs } from 'file-saver';
 import { toast } from 'sonner';
 
 import { useStageStore } from '@/lib/store';
 import { useCanvasStore } from '@/lib/store/canvas';
-import { useMediaGenerationStore, isMediaPlaceholder } from '@/lib/store/media-generation';
+import { useMediaGenerationStore } from '@/lib/store/media-generation';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import type {
-  Slide,
-  PPTElementOutline,
-  PPTElementShadow,
-  PPTElementLink,
-} from '@/lib/types/slides';
+import {
+  enumerateAssetManifest,
+  slideMediaSlotDescriptors,
+  type Slide,
+  type PPTElementOutline,
+  type PPTElementShadow,
+  type PPTElementLink,
+} from '@openmaic/dsl';
 import type { Scene, SlideContent } from '@/lib/types/stage';
-import type { SpeechAction } from '@/lib/types/action';
 import { getElementRange, getLineElementPath, getTableSubThemeColor } from '@/lib/utils/element';
 import { type AST, toAST } from '@/lib/export/html-parser';
 import { type SvgPoints, toPoints, getSvgPathRange } from '@/lib/export/svg-path-parser';
 import { svg2Base64 } from '@/lib/export/svg2base64';
 import { latexToOmml } from '@/lib/export/latex-to-omml';
+import { inlineMathSource, proseToPlainText } from '@/lib/export/pptx-rich-text';
 import { createLogger } from '@/lib/logger';
+import { collectSpeechText } from './narration';
+import { inlineHtmlAssets, createAssetFetcher } from './inline-assets';
+import type { FetchAsset } from './inline-assets';
+import { createProxiedFetch } from './proxied-fetch';
+import {
+  listInteractivePages,
+  placeholderStyleFor,
+  pptxDeckScenes,
+  planPptxDeck,
+  pptxSlideNumbers,
+  renderScenePlaceholder,
+  slidesOnlyDeck,
+  type PptxDeckEntry,
+} from './pptx-scene-placeholders';
+import { qrPngDataUrl } from './qr-png';
+import { classroomPageUrl } from '@/lib/classroom/scene-deep-link';
+import type { AssetUrlLeaseState } from '@/lib/media/use-asset-url';
+import { resolveStoredBytes } from '@/lib/media/resolve-stored-bytes';
+import {
+  MISSING_ASSET_LEASE,
+  isConcreteMediaAddress,
+  renderableMediaUrl,
+  resolveMediaRef,
+  type MediaTaskState,
+} from '@/lib/media/resolve-media-ref';
+import { lookupMediaTask, resolveVideoMediaForElement } from '@/lib/media/media-task-resolution';
 
 const log = createLogger('ExportPPTX');
 
@@ -97,15 +126,22 @@ function formatHTML(html: string, ratioPx2Pt: number) {
         }
       }
 
+      // An inline formula is one run holding its LaTeX source, never the
+      // text of its rendered KaTeX tree.
+      const mathSource = inlineMathSource(item);
+
       if ('tagName' in item && item.tagName === 'br') {
         slices.push({ text: '', options: { breakLine: true } });
-      } else if ('content' in item) {
-        const text = item.content
-          .replace(/&nbsp;/g, ' ')
-          .replace(/&gt;/g, '>')
-          .replace(/&lt;/g, '<')
-          .replace(/&amp;/g, '&')
-          .replace(/\n/g, '');
+      } else if ('content' in item || mathSource !== null) {
+        const text =
+          mathSource !== null
+            ? mathSource
+            : (item as { content: string }).content
+                .replace(/&nbsp;/g, ' ')
+                .replace(/&gt;/g, '>')
+                .replace(/&lt;/g, '<')
+                .replace(/&amp;/g, '&')
+                .replace(/\n/g, '');
         const options: pptxgen.TextPropsOptions = {};
 
         if (styleObj['font-size']) {
@@ -205,44 +241,49 @@ type Points = Array<
   | { close: true }
 >;
 
-function formatPoints(points: SvgPoints, ratioPx2Inch: number, scale = { x: 1, y: 1 }): Points {
+function formatPoints(
+  points: SvgPoints,
+  ratioPx2Inch: number,
+  scale = { x: 1, y: 1 },
+  origin = { x: 0, y: 0 },
+): Points {
   return points.map((point) => {
     if (point.close !== undefined) {
       return { close: true };
     } else if (point.type === 'M') {
       return {
-        x: ((point.x as number) / ratioPx2Inch) * scale.x,
-        y: ((point.y as number) / ratioPx2Inch) * scale.y,
+        x: (((point.x as number) - origin.x) / ratioPx2Inch) * scale.x,
+        y: (((point.y as number) - origin.y) / ratioPx2Inch) * scale.y,
         moveTo: true,
       };
     } else if (point.curve) {
       if (point.curve.type === 'cubic') {
         return {
-          x: ((point.x as number) / ratioPx2Inch) * scale.x,
-          y: ((point.y as number) / ratioPx2Inch) * scale.y,
+          x: (((point.x as number) - origin.x) / ratioPx2Inch) * scale.x,
+          y: (((point.y as number) - origin.y) / ratioPx2Inch) * scale.y,
           curve: {
             type: 'cubic' as const,
-            x1: ((point.curve.x1 as number) / ratioPx2Inch) * scale.x,
-            y1: ((point.curve.y1 as number) / ratioPx2Inch) * scale.y,
-            x2: ((point.curve.x2 as number) / ratioPx2Inch) * scale.x,
-            y2: ((point.curve.y2 as number) / ratioPx2Inch) * scale.y,
+            x1: (((point.curve.x1 as number) - origin.x) / ratioPx2Inch) * scale.x,
+            y1: (((point.curve.y1 as number) - origin.y) / ratioPx2Inch) * scale.y,
+            x2: (((point.curve.x2 as number) - origin.x) / ratioPx2Inch) * scale.x,
+            y2: (((point.curve.y2 as number) - origin.y) / ratioPx2Inch) * scale.y,
           },
         };
       } else if (point.curve.type === 'quadratic') {
         return {
-          x: ((point.x as number) / ratioPx2Inch) * scale.x,
-          y: ((point.y as number) / ratioPx2Inch) * scale.y,
+          x: (((point.x as number) - origin.x) / ratioPx2Inch) * scale.x,
+          y: (((point.y as number) - origin.y) / ratioPx2Inch) * scale.y,
           curve: {
             type: 'quadratic' as const,
-            x1: ((point.curve.x1 as number) / ratioPx2Inch) * scale.x,
-            y1: ((point.curve.y1 as number) / ratioPx2Inch) * scale.y,
+            x1: (((point.curve.x1 as number) - origin.x) / ratioPx2Inch) * scale.x,
+            y1: (((point.curve.y1 as number) - origin.y) / ratioPx2Inch) * scale.y,
           },
         };
       }
     }
     return {
-      x: ((point.x as number) / ratioPx2Inch) * scale.x,
-      y: ((point.y as number) / ratioPx2Inch) * scale.y,
+      x: (((point.x as number) - origin.x) / ratioPx2Inch) * scale.x,
+      y: (((point.y as number) - origin.y) / ratioPx2Inch) * scale.y,
     };
   });
 }
@@ -293,8 +334,11 @@ function getShadowOption(shadow: PPTElementShadow, ratioPx2Pt: number): pptxgen.
     type: 'outer',
     color: c.color.replace('#', ''),
     opacity: c.alpha,
+    // pptxgenjs shadow blur AND offset are in points; the source model is in
+    // pixels. blur was converted but offset was not, so shadows exported ~33%
+    // too far at the default viewport (ratioPx2Pt = 96/72 × viewportSize/960).
     blur: shadow.blur / ratioPx2Pt,
-    offset,
+    offset: offset / ratioPx2Pt,
     angle,
   };
 }
@@ -319,12 +363,17 @@ function getOutlineOption(outline: PPTElementOutline, ratioPx2Pt: number): pptxg
 
 // ── Link config ──
 
-function getLinkOption(link: PPTElementLink, slides: Slide[]): pptxgen.HyperlinkProps | null {
+// `slideNumbers` maps a slide id to its 1-based PPTX slide number. It is not
+// the index in `slides`: placeholder slides for non-slide scenes sit in between.
+function getLinkOption(
+  link: PPTElementLink,
+  slideNumbers: ReadonlyMap<string, number>,
+): pptxgen.HyperlinkProps | null {
   const { type, target } = link;
   if (type === 'web') return { url: target };
   if (type === 'slide') {
-    const index = slides.findIndex((slide) => slide.id === target);
-    if (index !== -1) return { slide: index + 1 };
+    const slideNumber = slideNumbers.get(target);
+    if (slideNumber !== undefined) return { slide: slideNumber };
   }
   return null;
 }
@@ -347,36 +396,196 @@ function isSVGImage(url: string) {
  * Extract speaker notes text from a scene's actions.
  * Concatenates speech text and action labels into plain text.
  */
+/**
+ * Speaker notes for one slide: the scene's speech text in action order.
+ * Delegates to the shared narration walk in `./narration` (#1142) with its
+ * historical options — whitespace-only speech is kept and parts are not
+ * trimmed, matching the pre-refactor notes output.
+ */
 function buildSpeakerNotes(scene: Scene): string {
-  if (!scene.actions || scene.actions.length === 0) return '';
-
-  const parts: string[] = [];
-  for (const action of scene.actions) {
-    if (action.type === 'speech') {
-      parts.push((action as SpeechAction).text);
-    }
-  }
-  return parts.join('\n');
+  return collectSpeechText(scene);
 }
 
-async function buildPptxBlob(
+async function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result as string);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+export function resolvePptxMediaBinding(
+  ref: string | undefined,
+  task: MediaTaskState | undefined,
+  lease: AssetUrlLeaseState = MISSING_ASSET_LEASE,
+  mediaGenerationDisabled = false,
+) {
+  const resolution = resolveMediaRef(ref, task, lease, mediaGenerationDisabled);
+  return { resolution, src: renderableMediaUrl(resolution) ?? '' };
+}
+
+/**
+ * Resolve one media ref to an embeddable PPTX source through the shared
+ * resolver, so no export-element branch carries its own fallback chain.
+ *
+ * An opaque ref (allocated id or legacy placeholder) resolves pool-first via
+ * {@link resolveStoredBytes} -- then the compatibility row, then the task's
+ * resolved URL, every level gated on the media-resolution state machine -- and
+ * embeds as a data URL. A concrete address resolves to itself through the
+ * state machine and keeps the caller's legacy fetch path. Returns '' when no
+ * level yields a renderable source; the caller skips the element.
+ */
+async function resolvePptxEmbeddableSrc(
+  ref: string | undefined,
+  task: MediaTaskState | undefined,
+  stageId?: string,
+): Promise<string> {
+  if (!ref) return '';
+  if (!isConcreteMediaAddress(ref)) {
+    const stored = await resolveStoredBytes(ref, {
+      stageId,
+      resolutionGating: true,
+      loadCompatRow: true,
+      taskUrlFallback: true,
+      fetchPolicy: { requireOk: true, requireNonEmpty: false },
+    });
+    if (stored) return blobToDataUrl(stored);
+  }
+  const tasks = useMediaGenerationStore.getState().tasks;
+  const effectiveTask = task ?? lookupMediaTask(tasks, ref, stageId);
+  return renderableMediaUrl(resolvePptxMediaBinding(ref, effectiveTask).resolution) ?? '';
+}
+
+/**
+ * Derive the document-wide candidate set for PPTX media resolution through the
+ * standard manifest. The PPTX document is the ordered slide list it renders;
+ * speaker-note actions and non-rendered whiteboards are intentionally outside
+ * this media scope.
+ */
+export function derivePptxMediaReferenceSet(slides: readonly Slide[]): ReadonlySet<string> {
+  const scenes = slides.map(
+    (slide, index) =>
+      ({
+        id: `pptx-slide-${index}`,
+        stageId: 'pptx-export',
+        type: 'slide',
+        title: '',
+        order: index,
+        content: { type: 'slide', canvas: slide },
+      }) as Scene,
+  );
+  return new Set(enumerateAssetManifest({ stage: {}, scenes }).entries.map(({ ref }) => ref));
+}
+
+/**
+ * The manifest-guard predicate: is this ref foreign to the PPTX document's
+ * asset manifest, with no task ownership that would legitimate it? A generated
+ * task may supply concrete runtime URLs (its objectUrl, or the poster of an
+ * element without one) that are runtime metadata rather than document refs;
+ * every other ref the layout resolves must come from the manifest. Exported so
+ * the guard's foreign-ref rejection stays directly testable.
+ */
+export function isPptxManifestForeignRef(
+  ref: string | undefined,
+  manifestRefs: ReadonlySet<string>,
+  task: MediaTaskState | undefined,
+): boolean {
+  return !!ref && !manifestRefs.has(ref) && task?.objectUrl !== ref;
+}
+
+/**
+ * Pin the manifest and layout walks together. Element iteration remains
+ * necessary for coordinates, z-order and video binding selection; it may not
+ * introduce or omit a media role relative to the manifest.
+ */
+export function assertPptxMediaReferenceParity(
+  slides: readonly Slide[],
+  manifestRefs: ReadonlySet<string>,
+): void {
+  const layoutRefs = new Set<string>();
+  for (const slide of slides) {
+    for (const slot of slideMediaSlotDescriptors(slide)) {
+      if (slot.ref) layoutRefs.add(slot.ref);
+    }
+  }
+  const missingFromLayout = [...manifestRefs].filter((ref) => !layoutRefs.has(ref));
+  const missingFromManifest = [...layoutRefs].filter((ref) => !manifestRefs.has(ref));
+  if (missingFromLayout.length > 0 || missingFromManifest.length > 0) {
+    throw new Error(
+      `PPTX media manifest/layout mismatch: ` +
+        `manifest-only=${JSON.stringify(missingFromLayout)}, ` +
+        `layout-only=${JSON.stringify(missingFromManifest)}`,
+    );
+  }
+}
+
+// Exported for the round-trip integration test harness — the test wires its
+// own slides + ratios in and inspects the resulting PPTX bytes via JSZip.
+// The hook below is still the only intended runtime caller.
+//
+// `deck` orders the output in lesson order and inserts placeholder slides for
+// quiz / interactive scenes (see `planPptxDeck`). Without it the PPTX holds the
+// slide scenes only.
+export async function buildPptxBlob(
   slides: Slide[],
   slideScenes: Scene[],
   viewportRatio: number,
   viewportSize: number,
   ratioPx2Inch: number,
   ratioPx2Pt: number,
+  stageId?: string,
+  deck: readonly PptxDeckEntry[] = slidesOnlyDeck(slides.length),
 ): Promise<Blob> {
   const pptx = new pptxgen();
+  const documentElements = slides.flatMap((slide) => slide.elements);
+  const manifestRefs = derivePptxMediaReferenceSet(slides);
+  assertPptxMediaReferenceParity(slides, manifestRefs);
+  const resolveManifestMedia = (
+    ref: string | undefined,
+    task: MediaTaskState | undefined,
+  ): Promise<string> => {
+    // A generated task may supply a concrete poster URL that is runtime
+    // metadata rather than a document ref. Preserve that established fallback;
+    // every document-owned ref must still come from the manifest.
+    if (isPptxManifestForeignRef(ref, manifestRefs, task)) {
+      throw new Error(`PPTX layout attempted to resolve a ref outside the asset manifest: ${ref}`);
+    }
+    return resolvePptxEmbeddableSrc(ref, task, stageId);
+  };
 
   // Set layout based on aspect ratio
   if (viewportRatio === 0.625) pptx.layout = 'LAYOUT_16x10';
   else if (viewportRatio === 0.75) pptx.layout = 'LAYOUT_4x3';
   else pptx.layout = 'LAYOUT_16x9';
 
-  for (let slideIdx = 0; slideIdx < slides.length; slideIdx++) {
-    const slide = slides[slideIdx];
+  const slideNumbers = pptxSlideNumbers(deck, slides);
+  const placeholderStyle = placeholderStyleFor(slides);
+
+  for (const entry of deck) {
     const pptxSlide = pptx.addSlide();
+
+    if (entry.kind === 'placeholder') {
+      // Quiz narration often explains the answers, so it stays out of the
+      // notes; interactive scenes keep theirs.
+      if (entry.placeholder.sceneType === 'interactive') {
+        const notes = buildSpeakerNotes(entry.placeholder.scene);
+        if (notes) pptxSlide.addNotes(notes);
+      }
+      const onlineUrl = entry.placeholder.online?.url;
+      renderScenePlaceholder(
+        pptxSlide,
+        entry.placeholder,
+        placeholderStyle,
+        { viewportSize, viewportRatio },
+        { ratioPx2Inch, ratioPx2Pt },
+        onlineUrl ? await qrPngDataUrl(onlineUrl) : undefined,
+      );
+      continue;
+    }
+
+    const slideIdx = entry.slideIndex;
+    const slide = slides[slideIdx];
 
     // ── Speaker Notes ──
     const scene = slideScenes[slideIdx];
@@ -389,18 +598,21 @@ async function buildPptxBlob(
     if (slide.background) {
       const bg = slide.background;
       if (bg.type === 'image' && bg.image) {
-        if (isSVGImage(bg.image.src)) {
+        const resolvedSrc = await resolveManifestMedia(bg.image.src, undefined);
+        if (!resolvedSrc) {
+          // Missing generated backgrounds stay empty instead of leaking an opaque ref to pptxgen.
+        } else if (isSVGImage(resolvedSrc)) {
           pptxSlide.addImage({
-            data: bg.image.src,
+            data: resolvedSrc,
             x: 0,
             y: 0,
             w: viewportSize / ratioPx2Inch,
             h: (viewportSize * viewportRatio) / ratioPx2Inch,
           });
-        } else if (isBase64Image(bg.image.src)) {
-          pptxSlide.background = { data: bg.image.src };
+        } else if (isBase64Image(resolvedSrc)) {
+          pptxSlide.background = { data: resolvedSrc };
         } else {
-          pptxSlide.background = { path: bg.image.src };
+          pptxSlide.background = { path: resolvedSrc };
         }
       } else if (bg.type === 'solid' && bg.color) {
         const c = formatColor(bg.color);
@@ -424,7 +636,15 @@ async function buildPptxBlob(
     if (!slide.elements) continue;
 
     // ── Elements ──
-    for (const el of slide.elements) {
+    for (const sourceElement of slide.elements) {
+      // Export the same bounded text projection that playback uses, including
+      // historical shapes whose geometry cannot be parsed or scaled safely.
+      const el =
+        sourceElement.type === 'shape' &&
+        !validateShapeGeometry(sourceElement, RENDER_PATH_LIMITS).ok
+          ? shapeToTextFallback(sourceElement)
+          : sourceElement;
+      if (!el) continue;
       // ── TEXT ──
       if (el.type === 'text') {
         const textProps = formatHTML(el.content, ratioPx2Pt);
@@ -436,7 +656,7 @@ async function buildPptxBlob(
           fontSize: DEFAULT_FONT_SIZE / ratioPx2Pt,
           fontFace: el.defaultFontName || DEFAULT_FONT_FAMILY,
           color: '#000000',
-          valign: 'top',
+          valign: el.vAlign ?? 'top',
           margin: 10 / ratioPx2Pt,
           paraSpaceBefore: 5 / ratioPx2Pt,
           lineSpacingMultiple: 1.5 / 1.25,
@@ -461,35 +681,46 @@ async function buildPptxBlob(
         if (el.paragraphSpace !== undefined)
           options.paraSpaceBefore = el.paragraphSpace / ratioPx2Pt;
         if (el.vertical) options.vert = 'eaVert';
-
         pptxSlide.addText(textProps, options);
+        if (el.link) {
+          const hyperlink = getLinkOption(el.link, slideNumbers);
+          if (hyperlink) {
+            // PptxGenJS does not create a relationship for hyperlinks on a
+            // rich-text box's options (it emits rIdundefined). A transparent
+            // shape above the label also makes the whole element clickable.
+            pptxSlide.addShape('rect' as pptxgen.ShapeType, {
+              x: options.x,
+              y: options.y,
+              w: options.w,
+              h: options.h,
+              rotate: options.rotate,
+              fill: { color: '#ffffff', transparency: 100 },
+              line: { color: '#ffffff', transparency: 100 },
+              hyperlink,
+            });
+          }
+        }
       }
 
       // ── IMAGE ──
       else if (el.type === 'image') {
-        // Resolve placeholder src → actual image data
-        let resolvedSrc = el.src;
-        if (isMediaPlaceholder(el.src)) {
-          const task = useMediaGenerationStore.getState().tasks[el.src];
-          if (task?.status === 'done' && task.objectUrl) {
-            resolvedSrc = task.objectUrl;
-          } else {
-            continue; // Media not ready, skip
-          }
-        }
+        // Resolve the src through the shared stored-bytes resolver (opaque
+        // refs embed as data URLs; concrete addresses keep the fetch below).
+        let resolvedSrc = await resolveManifestMedia(el.src, undefined);
+        if (!resolvedSrc) continue;
 
         // Fetch and convert to base64 for embedding in PPTX
         // (blob: URLs and remote URLs won't work in offline PPTX)
         if (!isBase64Image(resolvedSrc)) {
           try {
             const resp = await fetch(resolvedSrc);
-            const blob = await resp.blob();
-            resolvedSrc = await new Promise<string>((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onloadend = () => resolve(reader.result as string);
-              reader.onerror = reject;
-              reader.readAsDataURL(blob);
-            });
+            if (!resp.ok) {
+              log.warn(
+                `Failed to fetch image (HTTP ${resp.status}), skipping element: ${resolvedSrc}`,
+              );
+              continue;
+            }
+            resolvedSrc = await blobToDataUrl(await resp.blob());
           } catch {
             log.warn('Failed to convert image to base64, skipping element');
             continue;
@@ -509,7 +740,7 @@ async function buildPptxBlob(
         if (el.flipV) options.flipV = el.flipV;
         if (el.rotate) options.rotate = el.rotate;
         if (el.link) {
-          const linkOption = getLinkOption(el.link, slides);
+          const linkOption = getLinkOption(el.link, slideNumbers);
           if (linkOption) options.hyperlink = linkOption;
         }
         if (el.filters?.opacity) options.transparency = 100 - parseInt(el.filters.opacity);
@@ -572,7 +803,7 @@ async function buildPptxBlob(
           if (el.flipH) imgOptions.flipH = el.flipH;
           if (el.flipV) imgOptions.flipV = el.flipV;
           if (el.link) {
-            const linkOption = getLinkOption(el.link, slides);
+            const linkOption = getLinkOption(el.link, slideNumbers);
             if (linkOption) imgOptions.hyperlink = linkOption;
           }
           pptxSlide.addImage(imgOptions);
@@ -581,7 +812,9 @@ async function buildPptxBlob(
             x: el.width / el.viewBox[0],
             y: el.height / el.viewBox[1],
           };
-          const points = formatPoints(toPoints(el.path), ratioPx2Inch, scale);
+          const rawPoints = toPoints(el.path);
+          if (!rawPoints.length) continue; // Malformed path — toPoints already logged.
+          const points = formatPoints(rawPoints, ratioPx2Inch, scale);
 
           let fillColor = formatColor(el.fill);
           if (el.gradient) {
@@ -611,7 +844,7 @@ async function buildPptxBlob(
           if (el.outline?.width) shapeOptions.line = getOutlineOption(el.outline, ratioPx2Pt);
           if (el.rotate) shapeOptions.rotate = el.rotate;
           if (el.link) {
-            const linkOption = getLinkOption(el.link, slides);
+            const linkOption = getLinkOption(el.link, slideNumbers);
             if (linkOption) shapeOptions.hyperlink = linkOption;
           }
 
@@ -654,7 +887,7 @@ async function buildPptxBlob(
           if (el.flipV) patternOptions.flipV = el.flipV;
           if (el.rotate) patternOptions.rotate = el.rotate;
           if (el.link) {
-            const linkOption = getLinkOption(el.link, slides);
+            const linkOption = getLinkOption(el.link, slideNumbers);
             if (linkOption) patternOptions.hyperlink = linkOption;
           }
           pptxSlide.addImage(patternOptions);
@@ -664,13 +897,18 @@ async function buildPptxBlob(
       // ── LINE ──
       else if (el.type === 'line') {
         const path = getLineElementPath(el);
-        const points = formatPoints(toPoints(path), ratioPx2Inch);
         const { minX, maxX, minY, maxY } = getElementRange(el);
+        // Custom geometry points are relative to its bounding box, which need
+        // not begin at the element origin (negative controls / offset endpoints).
+        const points = formatPoints(toPoints(path), ratioPx2Inch, undefined, {
+          x: minX - el.left,
+          y: minY - el.top,
+        });
         const c = formatColor(el.color);
 
         const lineOptions: pptxgen.ShapeProps = {
-          x: el.left / ratioPx2Inch,
-          y: el.top / ratioPx2Inch,
+          x: minX / ratioPx2Inch,
+          y: minY / ratioPx2Inch,
           w: (maxX - minX) / ratioPx2Inch,
           h: (maxY - minY) / ratioPx2Inch,
           line: {
@@ -857,7 +1095,7 @@ async function buildPptxBlob(
             if (cell.style?.color) cellOptions.color = formatColor(cell.style.color).color;
 
             if (!hiddenCells.includes(`${i}_${j}`)) {
-              _row.push({ text: cell.text, options: cellOptions });
+              _row.push({ text: proseToPlainText(cell.text), options: cellOptions });
             }
           }
           if (_row.length) tableData.push(_row);
@@ -871,7 +1109,7 @@ async function buildPptxBlob(
           colW: el.colWidths.map((item) => (el.width * item) / ratioPx2Inch),
         };
         if (el.theme) tableOptions.fill = { color: '#ffffff' };
-        if (el.outline.width && el.outline.color) {
+        if (el.outline?.width && el.outline?.color) {
           tableOptions.border = {
             type: el.outline.style === 'solid' ? 'solid' : 'dash',
             pt: el.outline.width / ratioPx2Pt,
@@ -939,7 +1177,7 @@ async function buildPptxBlob(
             h: el.height / ratioPx2Inch,
           };
           if (el.link) {
-            const linkOption = getLinkOption(el.link, slides);
+            const linkOption = getLinkOption(el.link, slideNumbers);
             if (linkOption) latexOptions.hyperlink = linkOption;
           }
 
@@ -949,28 +1187,32 @@ async function buildPptxBlob(
 
       // ── VIDEO / AUDIO ──
       else if (el.type === 'video' || el.type === 'audio') {
-        // Resolve placeholder src → blob URL from media generation store
-        let resolvedSrc = el.src;
-        if (isMediaPlaceholder(el.src)) {
-          const task = useMediaGenerationStore.getState().tasks[el.src];
-          if (task?.status === 'done' && task.objectUrl) {
-            resolvedSrc = task.objectUrl;
-          } else {
-            continue; // Media not ready, skip
-          }
-        }
+        const videoBinding =
+          el.type === 'video'
+            ? resolveVideoMediaForElement(
+                useMediaGenerationStore.getState().tasks,
+                el,
+                stageId,
+                documentElements,
+              )
+            : undefined;
+        const sourceRef = videoBinding?.sourceRef ?? el.src;
+        const resolvedSrc = await resolveManifestMedia(sourceRef, videoBinding?.task);
+
+        if (!resolvedSrc) continue;
 
         // Fetch blob and convert to base64 for embedding in PPTX
         // (blob: URLs and remote URLs won't work in offline PPTX)
         try {
-          const resp = await fetch(resolvedSrc);
-          const blob = await resp.blob();
-          const base64 = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onloadend = () => resolve(reader.result as string);
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-          });
+          const base64 = isBase64Image(resolvedSrc)
+            ? resolvedSrc
+            : await (async () => {
+                const resp = await fetch(resolvedSrc);
+                if (!resp.ok) {
+                  throw new Error(`Failed to fetch media (HTTP ${resp.status}): ${resolvedSrc}`);
+                }
+                return blobToDataUrl(await resp.blob());
+              })();
 
           const mediaOptions: pptxgen.MediaProps = {
             x: el.left / ratioPx2Inch,
@@ -991,24 +1233,26 @@ async function buildPptxBlob(
           if (el.type === 'video') {
             let coverBase64: string | undefined;
 
-            // 1. Try poster from element or media generation store
-            let posterUrl = 'poster' in el && el.poster ? el.poster : undefined;
-            if (!posterUrl && isMediaPlaceholder(el.src)) {
-              const task = useMediaGenerationStore.getState().tasks[el.src];
-              if (task?.poster) posterUrl = task.poster;
-            }
-            if (posterUrl) {
-              try {
-                const posterResp = await fetch(posterUrl);
-                const posterBlob = await posterResp.blob();
-                coverBase64 = await new Promise<string>((resolve, reject) => {
-                  const reader = new FileReader();
-                  reader.onloadend = () => resolve(reader.result as string);
-                  reader.onerror = reject;
-                  reader.readAsDataURL(posterBlob);
-                });
-              } catch {
-                // Poster fetch failed, fall through to video frame capture
+            // 1. Try the poster the element (or its generation task) names,
+            // resolved through the same shared chain as the media itself.
+            const posterSrc = await resolveManifestMedia(
+              videoBinding?.posterRef,
+              videoBinding?.posterTask,
+            );
+            if (posterSrc) {
+              if (isBase64Image(posterSrc)) {
+                coverBase64 = posterSrc;
+              } else {
+                try {
+                  const posterResp = await fetch(posterSrc);
+                  if (!posterResp.ok) {
+                    log.warn(`Failed to fetch poster (HTTP ${posterResp.status}), skipping`);
+                  } else {
+                    coverBase64 = await blobToDataUrl(await posterResp.blob());
+                  }
+                } catch {
+                  // Poster fetch failed, fall through to video frame capture
+                }
               }
             }
 
@@ -1064,9 +1308,107 @@ async function buildPptxBlob(
   return (await pptx.write({ outputType: 'blob' })) as Blob;
 }
 
+// ── Resource Pack assembly (PPTX + interactive HTML pages as ZIP) ──
+// Pure/async builder extracted from the hook so the assembly logic — which
+// scenes make it into the ZIP, whether the PPTX builder runs — is unit-testable
+// without a React/jsdom harness. The hook stays the only runtime caller.
+//
+// `getPptxBlob` is invoked whenever the lesson has a scene that gets a PPTX
+// slide (`pptxDeckScenes`): a slide, a quiz, a PBL project or an interactive
+// page, or only a slide for a slides-only export. With placeholders, every
+// shipped HTML page has a placeholder slide, so a non-empty pack holds a PPTX;
+// slides only, a lesson without slides ships its HTML pages alone
+// (`skippedPptx`). Returns `empty: true` (and a null blob) when there is
+// nothing to ship. The HTML page paths come from
+// `listInteractivePages`, the same list the PPTX placeholder links use.
+
+export interface ResourcePackResult {
+  /** Generated ZIP blob, or null when there is nothing to ship. */
+  blob: Blob | null;
+  /** True when no scene could be exported (no PPTX slide, no HTML page). */
+  empty: boolean;
+  /**
+   * True when the pack ships HTML pages without a PPTX: placeholder slides
+   * are not wanted and the lesson has no slide scene.
+   */
+  skippedPptx: boolean;
+  /** External asset URLs that could not be inlined into the HTML pages. */
+  failedAssetUrls: string[];
+}
+
+export async function buildResourcePackZip(
+  scenes: Scene[],
+  opts: {
+    viewportRatio: number;
+    viewportSize: number;
+    ratioPx2Inch: number;
+    ratioPx2Pt: number;
+    fileName: string;
+    /** Called only when the lesson has PPTX content; produces the PPTX blob. */
+    getPptxBlob: () => Promise<Blob>;
+    /** Whether the PPTX includes placeholder slides (default true). */
+    includePlaceholders?: boolean;
+    /** Passed through to `inlineHtmlAssets`; tests inject a no-op fetcher. */
+    fetcher?: FetchAsset;
+  },
+): Promise<ResourcePackResult> {
+  const JSZip = (await import('jszip')).default;
+  const zip = new JSZip();
+  const failedAssetUrls: string[] = [];
+
+  const hasPptx =
+    pptxDeckScenes(scenes, { includePlaceholders: opts.includePlaceholders }).length > 0;
+  const pages = listInteractivePages(scenes);
+
+  // Nothing to ship: no PPTX slide and no interactive page.
+  if (!hasPptx && pages.length === 0) {
+    return { blob: null, empty: true, skippedPptx: false, failedAssetUrls };
+  }
+
+  // 1. Add interactive HTML pages
+  for (const page of pages) {
+    const { html: inlinedHtml, report } = await inlineHtmlAssets(page.html, {
+      fetcher: opts.fetcher,
+    });
+    for (const f of report.failed) {
+      if (!failedAssetUrls.includes(f.url)) failedAssetUrls.push(f.url);
+    }
+    zip.file(page.path, inlinedHtml);
+  }
+
+  // 2. Generate the PPTX (slides, plus placeholders unless slides only).
+  if (hasPptx) {
+    const pptxBlob = await opts.getPptxBlob();
+    // Convert to ArrayBuffer so jszip stores a plain byte buffer rather than a
+    // Blob (which it can't reliably round-trip outside the browser).
+    zip.file(`${opts.fileName}.pptx`, await pptxBlob.arrayBuffer());
+  }
+
+  const blob = await zip.generateAsync({ type: 'blob' });
+  return { blob, empty: false, skippedPptx: !hasPptx, failedAssetUrls };
+}
+
 // ── Hook ──
 
-export function useExportPPTX() {
+export interface UseExportPPTXOptions {
+  /**
+   * Origin the placeholder slides link to (`<origin>/classroom/<id>`).
+   * Defaults to the page's own origin; hosts serving the classroom elsewhere
+   * can override it.
+   */
+  classroomOrigin?: string;
+}
+
+/** Per-export choices, made in the export menu. */
+export interface PptxExportChoice {
+  /**
+   * Whether the PPTX includes placeholder slides for quiz, interactive and
+   * PBL scenes (default true). When false it holds the slide scenes only.
+   */
+  includePlaceholders?: boolean;
+}
+
+export function useExportPPTX({ classroomOrigin }: UseExportPPTXOptions = {}) {
   const [exporting, setExporting] = useState(false);
   const exportingRef = useRef(false);
   const { t } = useI18n();
@@ -1082,10 +1424,28 @@ export function useExportPPTX() {
   const slideScenes = scenes.filter((s) => s.content.type === 'slide');
   const slides = slideScenes.map((s) => (s.content as SlideContent).canvas);
 
-  // Shared guard + state wrapper for export actions
+  // The online classroom page the placeholder slides link to (button + QR
+  // code). Anyone with the link can open a classroom, so no status lookup is
+  // needed; without a stage id there is nothing to link to.
+  const getClassroomUrl = useCallback(
+    () =>
+      stage?.id ? classroomPageUrl(classroomOrigin ?? window.location.origin, stage.id) : undefined,
+    [stage?.id, classroomOrigin],
+  );
+
+  // Shared guard + state wrapper for export actions.
+  // `hasPptxContent` is passed by actions that need something to put in the
+  // PPTX: slides, quizzes, PBL projects and interactive pages all become PPTX
+  // slides (only slides when placeholders are off). The resource pack reports
+  // an empty lesson itself via `result.empty`. When the guard rejects, callers
+  // get a toast instead of silence.
   const withExportGuard = useCallback(
-    (action: () => Promise<void>) => {
-      if (exportingRef.current || slides.length === 0) return;
+    (action: () => Promise<void>, hasPptxContent = true) => {
+      if (exportingRef.current) return;
+      if (!hasPptxContent) {
+        toast.warning(t('export.noSlides'));
+        return;
+      }
       exportingRef.current = true;
       setExporting(true);
       setTimeout(async () => {
@@ -1100,82 +1460,133 @@ export function useExportPPTX() {
         }
       }, 100);
     },
-    [slides.length, t],
+    [t],
   );
 
   // ── Export PPTX only ──
-  const exportPPTX = useCallback(() => {
-    withExportGuard(async () => {
-      const fileName = stage?.name || 'slides';
-      const blob = await buildPptxBlob(
-        slides,
-        slideScenes,
-        viewportRatio,
-        viewportSize,
-        ratioPx2Inch,
-        ratioPx2Pt,
+  const exportPPTX = useCallback(
+    ({ includePlaceholders = true }: PptxExportChoice = {}) => {
+      withExportGuard(
+        async () => {
+          const fileName = stage?.name || 'slides';
+          // No Resource Pack next to a standalone PPTX, so placeholders link to
+          // the online classroom only (no offline copy to point at).
+          const deck = planPptxDeck(scenes, t, {
+            linkInteractivePages: false,
+            classroomUrl: getClassroomUrl(),
+            includePlaceholders,
+          });
+          const blob = await buildPptxBlob(
+            slides,
+            slideScenes,
+            viewportRatio,
+            viewportSize,
+            ratioPx2Inch,
+            ratioPx2Pt,
+            stage?.id,
+            deck,
+          );
+          saveAs(blob, `${fileName}.pptx`);
+          toast.success(t('export.exportSuccess'));
+        },
+        pptxDeckScenes(scenes, { includePlaceholders }).length > 0,
       );
-      saveAs(blob, `${fileName}.pptx`);
-      toast.success(t('export.exportSuccess'));
-    });
-  }, [
-    withExportGuard,
-    slides,
-    slideScenes,
-    stage,
-    viewportSize,
-    viewportRatio,
-    ratioPx2Inch,
-    ratioPx2Pt,
-    t,
-  ]);
+    },
+    [
+      withExportGuard,
+      getClassroomUrl,
+      slides,
+      slideScenes,
+      scenes,
+      stage,
+      viewportSize,
+      viewportRatio,
+      ratioPx2Inch,
+      ratioPx2Pt,
+      t,
+    ],
+  );
 
   // ── Export Resource Pack (PPTX + interactive HTML pages as ZIP) ──
-  const exportResourcePack = useCallback(() => {
-    withExportGuard(async () => {
-      const JSZip = (await import('jszip')).default;
-      const zip = new JSZip();
-      const fileName = stage?.name || 'slides';
+  // No PPTX-content check in the guard: `buildResourcePackZip` reports an
+  // empty lesson itself and the hook shows "nothing to export".
+  const exportResourcePack = useCallback(
+    ({ includePlaceholders = true }: PptxExportChoice = {}) => {
+      withExportGuard(async () => {
+        const fileName = stage?.name || 'slides';
+        const sharedFetcher = createAssetFetcher({ fetchImpl: createProxiedFetch() });
+        const classroomUrl = getClassroomUrl();
 
-      // 1. Generate PPTX
-      const pptxBlob = await buildPptxBlob(
-        slides,
-        slideScenes,
-        viewportRatio,
-        viewportSize,
-        ratioPx2Inch,
-        ratioPx2Pt,
-      );
-      zip.file(`${fileName}.pptx`, pptxBlob);
+        const result = await buildResourcePackZip(scenes, {
+          viewportRatio,
+          viewportSize,
+          ratioPx2Inch,
+          ratioPx2Pt,
+          fileName,
+          fetcher: sharedFetcher,
+          getPptxBlob: () =>
+            buildPptxBlob(
+              slides,
+              slideScenes,
+              viewportRatio,
+              viewportSize,
+              ratioPx2Inch,
+              ratioPx2Pt,
+              stage?.id,
+              planPptxDeck(scenes, t, {
+                linkInteractivePages: true,
+                classroomUrl,
+                includePlaceholders,
+              }),
+            ),
+          includePlaceholders,
+        });
 
-      // 2. Add interactive HTML pages
-      let interactiveIndex = 0;
-      for (const scene of scenes) {
-        if (scene.content.type === 'interactive' && scene.content.html) {
-          interactiveIndex++;
-          const safeName = scene.title.replace(/[\\/:*?"<>|]/g, '_');
-          const htmlFileName = `interactive/${String(interactiveIndex).padStart(2, '0')}_${safeName}.html`;
-          zip.file(htmlFileName, scene.content.html);
+        if (result.empty) {
+          toast.warning(t('export.nothingToExport'));
+          return;
         }
-      }
-
-      // 3. Download ZIP
-      const zipBlob = await zip.generateAsync({ type: 'blob' });
-      saveAs(zipBlob, `${fileName}.zip`);
-      toast.success(t('export.exportSuccess'));
-    });
-  }, [
-    withExportGuard,
-    slides,
-    slideScenes,
-    scenes,
-    stage,
-    viewportSize,
-    viewportRatio,
-    ratioPx2Inch,
-    ratioPx2Pt,
-    t,
-  ]);
+        if (result.skippedPptx) {
+          toast.info(t('export.noSlidesSkipped'));
+        }
+        saveAs(result.blob!, `${fileName}.zip`);
+        toast.success(t('export.exportSuccess'));
+        if (result.failedAssetUrls.length > 0) {
+          log.warn(
+            'Resource Pack: some interactive-scene assets could not be inlined:',
+            result.failedAssetUrls,
+          );
+          const hosts = [
+            ...new Set(
+              result.failedAssetUrls.map((u) => {
+                try {
+                  return new URL(u).host;
+                } catch {
+                  return u;
+                }
+              }),
+            ),
+          ];
+          toast.warning(t('export.inlinePartial', { count: result.failedAssetUrls.length }), {
+            description: hosts.join(', '),
+          });
+        }
+      });
+    },
+    [
+      withExportGuard,
+      getClassroomUrl,
+      slides,
+      slideScenes,
+      scenes,
+      stage,
+      viewportSize,
+      viewportRatio,
+      ratioPx2Inch,
+      ratioPx2Pt,
+      t,
+    ],
+  );
 
   return { exporting, exportPPTX, exportResourcePack };
 }

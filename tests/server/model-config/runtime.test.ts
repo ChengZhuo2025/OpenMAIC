@@ -1,0 +1,215 @@
+import { describe, expect, it } from 'vitest';
+
+import { lookupFromLayers, requestMayChoose } from '@/lib/server/model-config/runtime';
+import type { ModelConfigLayer } from '@/lib/server/model-config/resolve-slot';
+
+const deployment: ModelConfigLayer = {
+  source: 'deployment',
+  config: {
+    providers: { openai: { preset: 'openai', apiKey: 'sk-operator', models: ['gpt-5.6-mini'] } },
+    // What DEFAULT_MODEL translates to: the default model, and the agent off.
+    slots: { llm: 'openai:gpt-5.6', agent: null },
+  },
+};
+const workspace: ModelConfigLayer = {
+  source: 'workspace',
+  config: {
+    providers: { ds: { preset: 'deepseek', apiKey: 'sk-user' } },
+    slots: { llm: 'ds:deepseek-v4-pro' },
+  },
+};
+
+describe('lookupFromLayers', () => {
+  it('answers with the server default where the workspace sets nothing', () => {
+    expect(lookupFromLayers('course.outline', { deployment, workspace: null })).toMatchObject({
+      status: 'assigned',
+      resolvedAt: 'llm',
+      source: 'default',
+      locked: false,
+      providerId: 'openai',
+      providerSource: 'deployment',
+      apiKey: 'sk-operator',
+      modelId: 'gpt-5.6',
+    });
+    expect(lookupFromLayers('agent', { deployment, workspace: null })).toEqual(
+      expect.objectContaining({ status: 'disabled', source: 'default', locked: false }),
+    );
+  });
+
+  it('lets the workspace replace a server default on the same node', () => {
+    expect(lookupFromLayers('llm', { deployment, workspace })).toMatchObject({
+      status: 'assigned',
+      resolvedAt: 'llm',
+      source: 'workspace',
+      providerId: 'ds',
+      providerSource: 'workspace',
+    });
+  });
+
+  it('prefers a workspace model anywhere up the tree over any default', () => {
+    // The deployment's default on the agent node itself (agent: null, as
+    // DEFAULT_MODEL translates) yields to the workspace's llm higher up.
+    expect(lookupFromLayers('agent', { deployment, workspace })).toMatchObject({
+      status: 'assigned',
+      resolvedAt: 'llm',
+      source: 'workspace',
+      providerId: 'ds',
+    });
+  });
+
+  it('lets a workspace use a deployment provider without seeing it as its own', () => {
+    const picks: ModelConfigLayer = {
+      source: 'workspace',
+      config: { slots: { 'course.content': 'openai:gpt-5.6-mini' } },
+    };
+    expect(
+      lookupFromLayers('course.content.slide', { deployment, workspace: picks }),
+    ).toMatchObject({
+      source: 'workspace',
+      providerSource: 'deployment',
+      apiKey: 'sk-operator',
+      modelId: 'gpt-5.6-mini',
+    });
+  });
+
+  it('has nothing without any layer', () => {
+    expect(lookupFromLayers('llm', { deployment: null, workspace: null })).toEqual({
+      status: 'unassigned',
+      slot: 'llm',
+    });
+  });
+
+  it('lets slots that name a retired Veo provider follow their parents again', () => {
+    // Google shut down the Veo provider's last models (#1940): a workspace
+    // that chose Veo, its own or the deployment's, falls back to the server
+    // default instead of failing every video call.
+    const deployment: ModelConfigLayer = {
+      source: 'deployment',
+      config: {
+        providers: {
+          kling: { preset: 'kling', apiKey: 'k' },
+          'server-veo': { preset: 'veo', apiKey: 'k' },
+        },
+        slots: { video: 'kling:kling-v2-6' },
+      },
+    };
+    for (const pick of [
+      'own-veo:veo-3.1-generate-preview',
+      'server-veo:veo-3.1-generate-preview',
+    ]) {
+      const workspace: ModelConfigLayer = {
+        source: 'workspace',
+        config: {
+          providers: { 'own-veo': { preset: 'veo', apiKey: 'k' } },
+          slots: { video: pick },
+        },
+      };
+      expect(lookupFromLayers('video', { deployment, workspace })).toMatchObject({
+        status: 'assigned',
+        source: 'default',
+        providerId: 'kling',
+        modelId: 'kling-v2-6',
+      });
+    }
+  });
+
+  it('leaves out providers a workspace added once allowUserKeys is false', () => {
+    const deployment: ModelConfigLayer = {
+      source: 'deployment',
+      config: {
+        allowUserKeys: false,
+        providers: {
+          op: { preset: 'deepseek', apiKey: 'k', models: ['deepseek-v4-pro', 'deepseek-flash'] },
+        },
+        slots: { llm: 'op:deepseek-v4-pro' },
+      },
+    };
+    const workspace: ModelConfigLayer = {
+      source: 'workspace',
+      config: {
+        providers: { mine: { preset: 'openai', apiKey: 'k' } },
+        slots: {
+          'course.outline': 'mine:gpt-5.6',
+          'course.actions': { model: 'op:deepseek-flash', fallback: 'mine:gpt-5.6' },
+          classroom: 'op:deepseek-flash',
+        },
+      },
+    };
+    const layers = { deployment, workspace };
+    // Named its own provider: follows the deployment's llm instead.
+    expect(lookupFromLayers('course.outline', layers)).toMatchObject({
+      providerId: 'op',
+      modelId: 'deepseek-v4-pro',
+    });
+    // Its own model on a deployment provider stays, without its fallback.
+    const actions = lookupFromLayers('course.actions', layers);
+    expect(actions).toMatchObject({ providerId: 'op', modelId: 'deepseek-flash' });
+    expect(actions).not.toHaveProperty('fallback');
+    expect(lookupFromLayers('classroom', layers)).toMatchObject({
+      modelId: 'deepseek-flash',
+    });
+
+    // Allowed again (the default), the workspace's providers count.
+    const { allowUserKeys: _off, ...rest } = deployment.config;
+    const allowed = { ...deployment, config: rest };
+    expect(lookupFromLayers('course.outline', { deployment: allowed, workspace })).toMatchObject({
+      providerId: 'mine',
+    });
+  });
+
+  it('keeps references to an id the deployment also declares without user keys', () => {
+    const deployment: ModelConfigLayer = {
+      source: 'deployment',
+      config: {
+        allowUserKeys: false,
+        providers: {
+          op: { preset: 'deepseek', apiKey: 'k', models: ['deepseek-v4-pro', 'deepseek-flash'] },
+        },
+      },
+    };
+    const workspace: ModelConfigLayer = {
+      source: 'workspace',
+      config: {
+        providers: { op: { preset: 'openai', apiKey: 'k' } },
+        slots: { llm: { model: 'op:deepseek-v4-pro', fallback: 'op:deepseek-flash' } },
+      },
+    };
+    expect(lookupFromLayers('llm', { deployment, workspace })).toMatchObject({
+      providerId: 'op',
+      modelId: 'deepseek-v4-pro',
+      fallback: { modelId: 'deepseek-flash' },
+    });
+  });
+});
+
+describe('requestMayChoose', () => {
+  const locked: ModelConfigLayer = {
+    source: 'deployment',
+    config: { ...deployment.config, lock: ['llm'] },
+  };
+  const yml = { legacyDefaults: false };
+  const legacy = { legacyDefaults: true };
+  const at = (slot: 'llm' | 'agent' | 'image', layers: Parameters<typeof lookupFromLayers>[1]) =>
+    lookupFromLayers(slot, layers);
+
+  it('lets a request name its own model where nothing is assigned', () => {
+    expect(requestMayChoose(at('llm', { deployment: null, workspace: null }), yml)).toBe(true);
+  });
+
+  it("keeps openmaic.yml's default, the workspace's choice and a lock", () => {
+    expect(requestMayChoose(at('llm', { deployment, workspace: null }), yml)).toBe(false);
+    expect(requestMayChoose(at('llm', { deployment, workspace }), yml)).toBe(false);
+    expect(requestMayChoose(at('llm', { deployment, workspace }), legacy)).toBe(false);
+    expect(requestMayChoose(at('llm', { deployment: locked, workspace: null }), legacy)).toBe(
+      false,
+    );
+    const all: ModelConfigLayer = { source: 'deployment', config: { lock: 'all' } };
+    expect(requestMayChoose(at('image', { deployment: all, workspace: null }), yml)).toBe(false);
+  });
+
+  it('ranks a default translated from the legacy variables below the request, as before', () => {
+    expect(requestMayChoose(at('llm', { deployment, workspace: null }), legacy)).toBe(true);
+    expect(requestMayChoose(at('agent', { deployment, workspace: null }), legacy)).toBe(true);
+    expect(requestMayChoose(at('agent', { deployment, workspace: null }), yml)).toBe(false);
+  });
+});

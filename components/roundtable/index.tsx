@@ -15,6 +15,8 @@ import {
   BookOpen,
   Loader2,
   Volume2,
+  Quote,
+  X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AudioIndicatorState } from './audio-indicator';
@@ -23,6 +25,8 @@ import { useAudioRecorder } from '@/lib/hooks/use-audio-recorder';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { toast } from 'sonner';
 import { useSettingsStore, PLAYBACK_SPEEDS } from '@/lib/store/settings';
+import { useModelCapabilities } from '@/lib/model-settings/use-model-settings';
+import { useASRAvailable } from '@/lib/hooks/use-asr-available';
 import { ProactiveCard } from '@/components/chat/proactive-card';
 import { PresentationSpeechOverlay } from '@/components/roundtable/presentation-speech-overlay';
 import { AvatarDisplay } from '@/components/ui/avatar-display';
@@ -59,12 +63,21 @@ interface RoundtableProps {
   readonly endFlashSessionType?: 'qa' | 'discussion';
   readonly thinkingState?: { stage: string; agentId?: string } | null;
   readonly isCueUser?: boolean;
+  readonly cueUserOptions?: string[];
+  /** Session entered the soft-closing grace window (client-side, ~15s). */
+  readonly isSoftClosing?: boolean;
+  readonly softCloseDeadline?: number;
   readonly isTopicPending?: boolean;
+  readonly canSendMessage?: () => boolean;
   readonly onMessageSend?: (message: string) => void;
   readonly onDiscussionStart?: (request: DiscussionAction) => void;
   readonly onDiscussionSkip?: () => void;
   readonly onStopDiscussion?: () => void;
+  readonly onContinueDiscussion?: () => void;
   readonly onInputActivate?: () => void;
+  readonly onUserInputActivity?: (
+    kind: 'text_input' | 'composition_start' | 'recording_start',
+  ) => void;
 
   readonly onResumeTopic?: () => void;
   readonly onPlayPause?: () => void;
@@ -91,7 +104,20 @@ interface RoundtableProps {
   /** Ref to the fullscreen container — passed to ProactiveCard so its portal
    *  renders inside the top-layer during presentation mode. */
   readonly fullscreenContainerRef?: React.RefObject<HTMLDivElement | null>;
+  readonly showElementReference?: boolean;
+  readonly canPickSlideElement?: boolean;
+  readonly elementPickActive?: boolean;
+  readonly onToggleElementPick?: () => void;
+  readonly elementReferencePill?: {
+    sceneLabel: string;
+    elementType: string;
+    displaySummary: string;
+  };
+  readonly onClearElementReference?: () => void;
 }
+
+// This must stay in sync with the non-presentation textarea's max-h-[100px] class.
+const NON_PRESENTATION_INPUT_MAX_HEIGHT_PX = 100;
 
 const VOICE_WAVE_BARS = [
   { peak: 18, duration: 0.55 },
@@ -147,12 +173,18 @@ export function Roundtable({
   endFlashSessionType = 'discussion',
   thinkingState,
   isCueUser,
+  cueUserOptions,
+  isSoftClosing,
+  softCloseDeadline,
   isTopicPending,
   onMessageSend,
+  canSendMessage,
   onDiscussionStart,
   onDiscussionSkip,
   onStopDiscussion,
+  onContinueDiscussion,
   onInputActivate,
+  onUserInputActivity,
 
   onResumeTopic,
   onPlayPause,
@@ -174,12 +206,20 @@ export function Roundtable({
   onTogglePresentation,
   onPresentationInteractionChange,
   fullscreenContainerRef,
+  showElementReference,
+  canPickSlideElement,
+  elementPickActive,
+  onToggleElementPick,
+  elementReferencePill,
+  onClearElementReference,
 }: RoundtableProps) {
   const { t } = useI18n();
   const ttsMuted = useSettingsStore((s) => s.ttsMuted);
   const setTTSMuted = useSettingsStore((s) => s.setTTSMuted);
-  const ttsEnabled = useSettingsStore((state) => state.ttsEnabled);
-  const asrEnabled = useSettingsStore((state) => state.asrEnabled);
+  // The workspace's tts and asr slots decide whether narration and speech
+  // input are available.
+  const ttsEnabled = !!useModelCapabilities().tts;
+  const asrEnabled = useASRAvailable();
   const chatAreaWidth = useSettingsStore((s) => s.chatAreaWidth);
   const ttsVolume = useSettingsStore((s) => s.ttsVolume);
   const setTTSVolume = useSettingsStore((s) => s.setTTSVolume);
@@ -191,11 +231,30 @@ export function Roundtable({
   const [isVoiceOpen, setIsVoiceOpen] = useState(false);
   const [inputValue, setInputValue] = useState('');
   const [userMessage, setUserMessage] = useState<string | null>(null);
+  // Fade the last visible row of suggested replies while more are scrolled below.
+  const [quickRepliesClipped, setQuickRepliesClipped] = useState(false);
+  const measureQuickReplies = useCallback((el: HTMLDivElement | null) => {
+    if (!el) return;
+    setQuickRepliesClipped(el.scrollHeight - el.scrollTop - el.clientHeight > 2);
+  }, []);
+  const nonPresentationInputRef = useRef<HTMLTextAreaElement>(null);
   const agentScrollRef = useRef<HTMLDivElement>(null);
   const bubbleScrollRef = useRef<HTMLDivElement>(null);
   const teacherAvatarRef = useRef<HTMLDivElement>(null);
   const studentAvatarRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const userMessageClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (isPresenting) return;
+    const textarea = nonPresentationInputRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.min(
+      textarea.scrollHeight,
+      NON_PRESENTATION_INPUT_MAX_HEIGHT_PX,
+    )}px`;
+  }, [inputValue, isInputOpen, isPresenting]);
 
   // End flash visible state (Issue 3)
   const [endFlashVisible, setEndFlashVisible] = useState(false);
@@ -343,6 +402,12 @@ export function Roundtable({
           setIsVoiceOpen(false);
           return;
         }
+        if (canSendMessage?.() === false) {
+          setInputValue(text);
+          setIsInputOpen(true);
+          setIsVoiceOpen(false);
+          return;
+        }
         showLocalUserMessage(text);
         onMessageSend?.(text);
         setIsSendCooldown(true);
@@ -356,12 +421,23 @@ export function Roundtable({
     });
 
   const handleSendMessage = () => {
-    if (!inputValue.trim() || isSendCooldown) return;
+    if (!inputValue.trim() || isSendCooldown || canSendMessage?.() === false) return;
 
     showLocalUserMessage(inputValue);
     onMessageSend?.(inputValue);
     setIsSendCooldown(true);
     isSendCooldownRef.current = true;
+    setInputValue('');
+    setIsInputOpen(false);
+  };
+
+  const handleQuickReply = (label: string) => {
+    if (isSendCooldownRef.current || canSendMessage?.() === false) return;
+
+    isSendCooldownRef.current = true;
+    setIsSendCooldown(true);
+    showLocalUserMessage(label);
+    onMessageSend?.(label);
     setInputValue('');
     setIsInputOpen(false);
   };
@@ -388,10 +464,17 @@ export function Roundtable({
     } else {
       if (isSendCooldown || isProcessing) return;
       onInputActivate?.();
+      onUserInputActivity?.('recording_start');
       setIsVoiceOpen(true);
       setIsInputOpen(false);
       startRecording();
     }
+  };
+
+  const handleContinueSoftClosing = () => {
+    onContinueDiscussion?.();
+    setIsVoiceOpen(false);
+    setIsInputOpen(true);
   };
 
   // Keyboard shortcuts for roundtable interaction (#255)
@@ -626,6 +709,8 @@ export function Roundtable({
             : 'idle'
       }
       isLiveSession={isStreaming || isTopicPending || engineMode === 'live'}
+      isSoftClosing={isSoftClosing}
+      softCloseDeadline={softCloseDeadline}
       whiteboardOpen={whiteboardOpen}
       sidebarCollapsed={sidebarCollapsed}
       chatCollapsed={chatCollapsed}
@@ -639,6 +724,7 @@ export function Roundtable({
       onTogglePresentation={onTogglePresentation}
       showStopDiscussion={showStopButton}
       onStopDiscussion={onStopDiscussion}
+      onContinueDiscussion={handleContinueSoftClosing}
       ttsEnabled={ttsEnabled}
       ttsMuted={ttsMuted}
       ttsVolume={ttsVolume}
@@ -648,8 +734,85 @@ export function Roundtable({
       onToggleAutoPlay={() => setAutoPlayLecture(!autoPlayLecture)}
       playbackSpeed={playbackSpeed}
       onCycleSpeed={handleCycleSpeed}
+      showElementReference={showElementReference}
+      canPickSlideElement={canPickSlideElement}
+      elementPickActive={elementPickActive}
+      onToggleElementPick={onToggleElementPick}
     />
   );
+  const referencePill = elementReferencePill ? (
+    <div
+      data-testid="slide-element-reference-pill"
+      className="pointer-events-auto flex max-w-[min(520px,calc(100vw-3rem))] items-center gap-2 rounded-full border border-violet-200 bg-white/95 px-3 py-1.5 text-xs shadow-lg backdrop-blur dark:border-violet-700 dark:bg-gray-900/95"
+      onClick={(event) => event.stopPropagation()}
+    >
+      <Quote className="h-3.5 w-3.5 shrink-0 text-violet-600 dark:text-violet-400" />
+      <span className="shrink-0 font-semibold text-violet-700 dark:text-violet-300">
+        {elementReferencePill.sceneLabel} · {elementReferencePill.elementType} ·
+      </span>
+      <span className="min-w-0 truncate text-gray-600 dark:text-gray-300">
+        {elementReferencePill.displaySummary}
+      </span>
+      <button
+        type="button"
+        onClick={onClearElementReference}
+        className="-mr-1 rounded-full p-0.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+        aria-label={t('chat.elementReference.clear')}
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  ) : null;
+  const quickReplyLabels = cueUserOptions?.filter((label) => label.trim()) ?? [];
+  const hasQuickReplies = quickReplyLabels.length > 0;
+  const showSuggestedReplies =
+    hasQuickReplies && !!isCueUser && !bubbleRole && !thinkingState && !isInputOpen && !isVoiceOpen;
+  // Suggested replies render as a "draft" user bubble: same slot, radius and
+  // avatar placement as the real user bubble, but outlined instead of filled
+  // so it reads as "you could say" rather than "you said".
+  const quickReplies = hasQuickReplies ? (
+    <div
+      data-testid="cue-user-options"
+      role="group"
+      aria-label={t('roundtable.yourTurn')}
+      ref={measureQuickReplies}
+      onScroll={(event) => measureQuickReplies(event.currentTarget)}
+      className={cn(
+        'flex min-w-0 max-h-[3.75rem] flex-wrap content-start gap-1.5 overflow-y-auto overscroll-contain scrollbar-hide',
+        quickRepliesClipped &&
+          '[mask-image:linear-gradient(to_bottom,#000_calc(100%-16px),transparent)]',
+      )}
+    >
+      {quickReplyLabels.map((label, index) => (
+        <button
+          key={`${index}-${label}`}
+          type="button"
+          title={label}
+          aria-label={label}
+          disabled={isSendCooldown}
+          onClick={(event) => {
+            event.stopPropagation();
+            handleQuickReply(label);
+          }}
+          className="h-[1.6875rem] max-w-full shrink-0 truncate rounded-full border border-purple-200 bg-white px-3 @max-[36rem]:px-2 text-[13px] leading-[1.5625rem] text-purple-700 shadow-[0_1px_2px_rgba(88,28,135,0.06)] transition-colors hover:border-purple-400 hover:bg-purple-600 hover:text-white focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-purple-500 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-50 dark:border-purple-700/70 dark:bg-gray-900/70 dark:text-purple-200 dark:hover:border-purple-400 dark:hover:bg-purple-500 dark:hover:text-white"
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  ) : null;
+  const suggestedReplyAvatar = (
+    <div
+      className="absolute -right-2.5 -top-2.5 z-20 pointer-events-none select-none"
+      title={t('roundtable.you')}
+    >
+      <div className="w-6 h-6 rounded-full overflow-hidden border-2 border-purple-300 dark:border-purple-500 bg-white dark:bg-gray-900 shadow-sm">
+        <AvatarDisplay src={userAvatar} alt={t('roundtable.you')} />
+      </div>
+    </div>
+  );
+  const suggestedReplyBubbleClass =
+    'relative flex flex-col rounded-2xl rounded-br-sm border border-dashed border-purple-300 bg-[#faf7ff] pl-3 pr-5 py-2.5 dark:border-purple-400/50 dark:bg-[#1f1830]';
 
   if (isPresenting) {
     return (
@@ -725,6 +888,7 @@ export function Roundtable({
           className="fixed bottom-14 left-0 z-[50] flex flex-col items-center justify-center gap-3 pointer-events-none transition-[right] duration-300"
           style={{ right: chatCollapsed === false ? (chatAreaWidth ?? 320) : 0 }}
         >
+          {referencePill}
           {/* Input panel */}
           <AnimatePresence>
             {isInputOpen && (
@@ -740,6 +904,8 @@ export function Roundtable({
                     <textarea
                       value={inputValue}
                       onChange={(e) => setInputValue(e.target.value)}
+                      onBeforeInput={() => onUserInputActivity?.('text_input')}
+                      onCompositionStart={() => onUserInputActivity?.('composition_start')}
                       onKeyDown={(e) => {
                         if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                           e.preventDefault();
@@ -816,6 +982,7 @@ export function Roundtable({
             {isCueUser && !bubbleRole && !thinkingState && !isInputOpen && !isVoiceOpen && (
               <motion.div
                 key="presentation-cue-user"
+                data-testid="cue-user-panel"
                 initial={{ opacity: 0, scale: 0.92, y: 8 }}
                 animate={{ opacity: 1, scale: 1, y: 0 }}
                 exit={{ opacity: 0, scale: 0.92, y: 8 }}
@@ -878,6 +1045,31 @@ export function Roundtable({
             buttonState={enrichedPlaybackView?.buttonState}
             isPaused={isDiscussionPaused || engineMode === 'paused'}
           />
+
+          {/* Suggested replies — draft user bubble above the dock */}
+          <AnimatePresence>
+            {showSuggestedReplies && (
+              <motion.div
+                key="presentation-suggested-replies"
+                data-testid="cue-user-suggested-bubble"
+                initial={{ opacity: 0, x: 20, y: 12 }}
+                animate={{ opacity: 1, x: 0, y: 0 }}
+                exit={{ opacity: 0, y: 8, transition: { duration: 0.12 } }}
+                transition={{ duration: 0.22, ease: [0.21, 1, 0.36, 1] }}
+                className="pointer-events-auto w-[min(420px,calc(100vw-3rem))]"
+              >
+                <div
+                  className={cn(
+                    suggestedReplyBubbleClass,
+                    'shadow-[0_18px_50px_-24px_rgba(88,28,135,0.45)]',
+                  )}
+                >
+                  {suggestedReplyAvatar}
+                  {quickReplies}
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           {/* Dock */}
           <AnimatePresence>
@@ -1052,6 +1244,7 @@ export function Roundtable({
 
   return (
     <div
+      data-testid="roundtable-region"
       className={cn(
         'h-[192px] w-full flex flex-col relative z-10 transition-all duration-300',
         isPresenting && !controlsVisible
@@ -1225,6 +1418,7 @@ export function Roundtable({
           </AnimatePresence>
 
           <div
+            data-testid="roundtable-non-presentation-card"
             onClick={() => {
               if (isInputOpen || isVoiceOpen) {
                 setIsInputOpen(false);
@@ -1232,13 +1426,17 @@ export function Roundtable({
                 if (isRecording || isProcessing) cancelRecording();
               }
             }}
-            className="relative w-full h-full rounded-[2.5rem] bg-gradient-to-b from-white/40 to-white/80 dark:from-gray-800/40 dark:to-gray-800/80 backdrop-blur-xl border border-white/50 dark:border-gray-700/50 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.05),inset_0_1px_0_0_rgba(255,255,255,0.9)] dark:shadow-[0_20px_60px_-15px_rgba(0,0,0,0.3)] flex flex-col justify-center px-6 overflow-hidden group transition-all duration-700 cursor-default"
+            className="relative w-full h-full rounded-[2.5rem] bg-gradient-to-b from-white/40 to-white/80 dark:from-gray-800/40 dark:to-gray-800/80 backdrop-blur-xl border border-white/50 dark:border-gray-700/50 shadow-[0_20px_60px_-15px_rgba(0,0,0,0.05),inset_0_1px_0_0_rgba(255,255,255,0.9)] dark:shadow-[0_20px_60px_-15px_rgba(0,0,0,0.3)] flex flex-col justify-center px-6 overflow-hidden group transition-all duration-700 cursor-default @container"
           >
+            {elementReferencePill && (
+              <div className="absolute left-1/2 top-2 z-30 -translate-x-1/2">{referencePill}</div>
+            )}
             {/* Text input box */}
             <AnimatePresence>
               {isInputOpen && (
                 <motion.div
                   key="input-stage"
+                  data-testid="roundtable-non-presentation-input-stage"
                   initial={{
                     opacity: 0,
                     scale: 0.95,
@@ -1250,11 +1448,17 @@ export function Roundtable({
                   onClick={(e) => e.stopPropagation()}
                   className="absolute inset-x-6 bottom-4 z-20 flex items-center justify-end"
                 >
-                  <div className="relative w-fit max-w-[85%] sm:max-w-[65%] min-w-[200px] sm:min-w-[300px] bg-white/90 dark:bg-gray-800/90 backdrop-blur-md p-2 pr-2 rounded-2xl rounded-br-none shadow-2xl border border-purple-200 dark:border-purple-700 flex items-end gap-2 ring-1 ring-purple-100/50 dark:ring-purple-800/50">
+                  <div
+                    data-testid="roundtable-non-presentation-input-panel"
+                    className="relative w-fit max-w-[85%] sm:max-w-[65%] min-w-[200px] sm:min-w-[300px] bg-white/90 dark:bg-gray-800/90 backdrop-blur-md p-2 pr-2 rounded-2xl rounded-br-none shadow-2xl border border-purple-200 dark:border-purple-700 flex items-end gap-2 ring-1 ring-purple-100/50 dark:ring-purple-800/50"
+                  >
                     <div className="pl-4 flex-1 py-1 min-w-0">
                       <textarea
+                        ref={nonPresentationInputRef}
                         value={inputValue}
                         onChange={(e) => setInputValue(e.target.value)}
+                        onBeforeInput={() => onUserInputActivity?.('text_input')}
+                        onCompositionStart={() => onUserInputActivity?.('composition_start')}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                             e.preventDefault();
@@ -1264,8 +1468,7 @@ export function Roundtable({
                         placeholder={t('roundtable.inputPlaceholder')}
                         autoFocus
                         rows={1}
-                        className="w-full resize-none bg-transparent border-none focus:ring-0 focus:outline-none outline-none shadow-none ring-0 text-gray-700 dark:text-gray-200 text-sm placeholder:text-gray-400 dark:placeholder:text-gray-500 min-h-[40px] max-h-[120px]"
-                        style={{ fieldSizing: 'content' } as Record<string, string>}
+                        className="w-full resize-none overflow-y-auto bg-transparent border-none focus:ring-0 focus:outline-none outline-none shadow-none ring-0 text-gray-700 dark:text-gray-200 text-sm placeholder:text-gray-400 dark:placeholder:text-gray-500 min-h-[40px] max-h-[100px]"
                       />
                     </div>
                     <button
@@ -1380,11 +1583,16 @@ export function Roundtable({
             <AnimatePresence>
               {isCueUser && !bubbleRole && !thinkingState && !isInputOpen && !isVoiceOpen && (
                 <motion.div
+                  data-testid="cue-user-panel"
                   initial={{ opacity: 0, scale: 0.85 }}
                   animate={{ opacity: 1, scale: 1 }}
                   exit={{ opacity: 0, scale: 0.85 }}
                   transition={{ duration: 0.35, ease: [0.21, 1, 0.36, 1] }}
-                  className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col items-center gap-2.5"
+                  className={cn(
+                    'absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 z-20 flex flex-col items-center gap-2.5',
+                    // On a narrow stage the suggested-reply bubble needs the full width.
+                    showSuggestedReplies && '@max-[36rem]:hidden',
+                  )}
                 >
                   {/* Button with ripple effect */}
                   <div className="relative flex items-center justify-center">
@@ -1520,9 +1728,35 @@ export function Roundtable({
               )}
             </AnimatePresence>
 
-            {/* Chat bubble */}
+            {/* Suggested replies (draft user bubble) and the chat bubble share one
+                slot and one presence group: they are mutually exclusive, and
+                mode="wait" lets the outgoing bubble finish its exit before the
+                next one mounts. Two separate groups would briefly stack both in
+                this vertically centered column, shifting the new bubble when the
+                old one unmounts. */}
             <AnimatePresence mode="wait">
-              {bubbleRole && (
+              {showSuggestedReplies ? (
+                <motion.div
+                  key="suggested-replies"
+                  data-testid="cue-user-suggested-bubble"
+                  initial={{ opacity: 0, y: 8 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -8, transition: { duration: 0.12 } }}
+                  transition={{ duration: 0.2, ease: [0.21, 1, 0.36, 1] }}
+                  className="w-full flex justify-end relative z-10"
+                >
+                  {/* On wide stages the width stops short of the centered mic cue */}
+                  <div
+                    className={cn(
+                      suggestedReplyBubbleClass,
+                      'w-full @[36rem]:w-[min(420px,calc(50%-3.5rem))] max-h-[110px] shadow-sm @max-[36rem]:pl-2 @max-[36rem]:pr-3',
+                    )}
+                  >
+                    {suggestedReplyAvatar}
+                    {quickReplies}
+                  </div>
+                </motion.div>
+              ) : bubbleRole ? (
                 <motion.div
                   key={bubbleKey}
                   initial={{ opacity: 0, y: 8 }}
@@ -1759,7 +1993,7 @@ export function Roundtable({
                     </div>
                   </div>
                 </motion.div>
-              )}
+              ) : null}
             </AnimatePresence>
           </div>
         </div>

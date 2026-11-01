@@ -1,7 +1,9 @@
 'use client';
 
 import { useMemo, useState, useEffect, useCallback } from 'react';
-import type { PPTShapeElement, ShapeText } from '@/lib/types/slides';
+import type { PPTShapeElement, ShapeText } from '@openmaic/dsl';
+import { validateShapeGeometry, RENDER_PATH_LIMITS, shapeToTextFallback } from '@openmaic/geometry';
+import { BaseTextElement } from '@openmaic/renderer/elements';
 import { useCanvasStore } from '@/lib/store';
 import { useCanvasOperations } from '@/lib/hooks/use-canvas-operations';
 import { useHistorySnapshot } from '@/lib/hooks/use-history-snapshot';
@@ -29,6 +31,19 @@ export interface ShapeElementProps {
  * Supports gradients, patterns, and rich text content
  */
 export function ShapeElement({ elementInfo, selectElement }: ShapeElementProps) {
+  const geometry = useMemo(
+    () =>
+      validateShapeGeometry(
+        {
+          path: elementInfo.path,
+          viewBox: elementInfo.viewBox,
+          width: elementInfo.width,
+          height: elementInfo.height,
+        },
+        RENDER_PATH_LIMITS,
+      ),
+    [elementInfo.path, elementInfo.viewBox, elementInfo.width, elementInfo.height],
+  );
   const handleElementId = useCanvasStore.use.handleElementId();
   const { updateElement, removeElementProps } = useCanvasOperations();
   const { addHistorySnapshot } = useHistorySnapshot();
@@ -63,8 +78,23 @@ export function ShapeElement({ elementInfo, selectElement }: ShapeElementProps) 
       defaultColor: '#000000',
     };
     if (!elementInfo.text) return defaultText;
-    return elementInfo.text;
+    return {
+      ...elementInfo.text,
+      content: typeof elementInfo.text.content === 'string' ? elementInfo.text.content : '',
+    };
   }, [elementInfo.text]);
+  const viewBoxWidth =
+    Array.isArray(elementInfo.viewBox) &&
+    Number.isFinite(elementInfo.viewBox[0]) &&
+    elementInfo.viewBox[0] > 0
+      ? elementInfo.viewBox[0]
+      : elementInfo.width || 1;
+  const viewBoxHeight =
+    Array.isArray(elementInfo.viewBox) &&
+    Number.isFinite(elementInfo.viewBox[1]) &&
+    elementInfo.viewBox[1] > 0
+      ? elementInfo.viewBox[1]
+      : elementInfo.height || 1;
 
   // Update text content
   const updateText = useCallback(
@@ -84,7 +114,8 @@ export function ShapeElement({ elementInfo, selectElement }: ShapeElementProps) 
   const checkEmptyText = useCallback(() => {
     if (!elementInfo.text) return;
 
-    const pureText = elementInfo.text.content.replace(/<[^>]+>/g, '');
+    const content = typeof elementInfo.text.content === 'string' ? elementInfo.text.content : '';
+    const pureText = content.replace(/<[^>]+>/g, '');
     if (!pureText) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- 'text' is specific to PPTShapeElement, not in keyof PPTElement union
       removeElementProps({ id: elementInfo.id, propName: 'text' as any });
@@ -96,6 +127,46 @@ export function ShapeElement({ elementInfo, selectElement }: ShapeElementProps) 
   const startEdit = () => {
     setEditable(true);
   };
+
+  if (!geometry.ok) {
+    const fallback = shapeToTextFallback(elementInfo);
+    if (!fallback) return null;
+    return (
+      <div
+        className={`editable-element-shape absolute pointer-events-auto ${elementInfo.lock ? 'lock' : ''}`}
+        data-shape-geometry-error={geometry.error.code}
+        style={{
+          top: fallback.top,
+          left: fallback.left,
+          width: fallback.width,
+          height: fallback.height,
+        }}
+        onMouseDown={(e) => handleSelectElement(e)}
+        onTouchStart={(e) => handleSelectElement(e)}
+        onDoubleClick={startEdit}
+      >
+        <BaseTextElement
+          elementInfo={{ ...fallback, left: 0, top: 0 }}
+          renderContent={(_element, content) =>
+            editable ? (
+              <ProsemirrorEditor
+                elementId={elementInfo.id}
+                defaultColor={fallback.defaultColor}
+                defaultFontName={fallback.defaultFontName}
+                editable={!elementInfo.lock}
+                value={fallback.content}
+                onUpdate={({ value, ignore }) => updateText(value, ignore)}
+                onBlur={checkEmptyText}
+                onMouseDown={(e) => handleSelectElement(e as React.MouseEvent, false)}
+              />
+            ) : (
+              content
+            )
+          }
+        />
+      </div>
+    );
+  }
 
   return (
     <div
@@ -144,8 +215,8 @@ export function ShapeElement({ elementInfo, selectElement }: ShapeElementProps) 
               )}
             </defs>
             <g
-              transform={`scale(${elementInfo.width / elementInfo.viewBox[0]}, ${
-                elementInfo.height / elementInfo.viewBox[1]
+              transform={`scale(${elementInfo.width / viewBoxWidth}, ${
+                elementInfo.height / viewBoxHeight
               }) translate(0,0) matrix(1,0,0,1,0,0)`}
             >
               <path

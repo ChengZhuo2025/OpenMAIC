@@ -10,12 +10,14 @@
  * - GLM TTS (https://docs.bigmodel.cn/cn/guide/models/sound-and-video/glm-tts)
  * - Qwen TTS (https://bailian.console.aliyun.com/)
  * - Doubao TTS (https://www.volcengine.com/docs/6561/1257543)
+ * - Google Gemini TTS (https://ai.google.dev/gemini-api/docs/speech-generation)
  * - Browser Native TTS (Web Speech API, client-side only)
  *
  * Currently Supported ASR Providers:
  * - OpenAI Whisper (https://platform.openai.com/docs/guides/speech-to-text)
  * - Browser Native (Web Speech API, client-side only)
  * - Qwen ASR (DashScope API)
+ * - Azure STT (https://learn.microsoft.com/azure/ai-services/speech-service/fast-transcription-create)
  *
  * Future Provider Support (extensible):
  * - ElevenLabs TTS/ASR (https://elevenlabs.io/docs)
@@ -83,9 +85,12 @@ export type BuiltInTTSProviderId =
   | 'azure-tts'
   | 'glm-tts'
   | 'qwen-tts'
+  | 'voxcpm-tts'
   | 'doubao-tts'
   | 'elevenlabs-tts'
   | 'minimax-tts'
+  | 'google-tts'
+  | 'lemonade-tts'
   | 'browser-native-tts';
 
 export type TTSProviderId = BuiltInTTSProviderId | `custom-tts-${string}`;
@@ -113,6 +118,22 @@ export interface TTSProviderConfig {
   requiresApiKey: boolean;
   defaultBaseUrl?: string;
   icon?: string;
+  /**
+   * Declared exclusion from the agent-facing voice catalog. A provider flagged
+   * here (e.g. a paid showcase whose presets must never be offered to the
+   * agent) is dropped from `list_voices` / `set_roster` binding validation
+   * even when it is served and keyed — an explicit mechanism, not "no env so
+   * absent". Session-registered clones of the provider remain bindable when a
+   * registration adapter is configured (see the agent catalog assembly).
+   */
+  excludeFromAgentVoiceCatalog?: boolean;
+  /**
+   * True when the provider has NO deployment default voice: its only
+   * synthesizable voices are the ones registered at runtime. Such a provider's
+   * registered voices stay in the catalog regardless of clone-synthesis
+   * capability, because they are the only voices that provider can produce.
+   */
+  requiresRegisteredVoice?: boolean;
   /** Available models. Empty array means provider has no model concept (e.g. Azure, Browser Native). */
   models: Array<{ id: string; name: string }>;
   /** Default model ID used when user hasn't selected one. Empty string if no models. */
@@ -124,6 +145,12 @@ export interface TTSProviderConfig {
     max: number;
     default: number;
   };
+  /**
+   * `false` when the provider ignores the requested speed, which locks the speed
+   * control in settings. Omitted means speed is supported; a missing
+   * `speedRange` does not imply the opposite.
+   */
+  supportsSpeed?: boolean;
 }
 
 /**
@@ -135,9 +162,34 @@ export interface TTSModelConfig {
   apiKey?: string;
   baseUrl?: string;
   voice: string;
+  /** Provider-local ordinary voices, resolved from stored server configuration. */
+  voices?: ConfiguredTTSVoice[];
   speed?: number;
   format?: string;
   providerOptions?: Record<string, unknown>;
+  /**
+   * Cancel the provider request(s) when this signal aborts. The agent runtime
+   * threads the session cancel signal here so an in-flight synthesis fetch is
+   * aborted within seconds of a cancel, instead of wedging the session until a
+   * restart repairs it.
+   */
+  signal?: AbortSignal;
+  /**
+   * Server-side outbound address policy for this provider call. `true` marks a
+   * client-supplied BYOK `baseUrl`: the request is pinned to the strict public
+   * policy, so metadata, private, loopback and CGNAT targets are refused even
+   * when the operator enabled local networks. When unset (a server-managed or
+   * built-in default target) the adapter falls back to the process-wide
+   * `ALLOW_LOCAL_NETWORKS` behavior.
+   */
+  publicOnly?: boolean;
+  /**
+   * `true` when the provider is server-configured: its endpoint is operator
+   * configuration and may be on a local network without ALLOW_LOCAL_NETWORKS
+   * (cloud metadata stays refused). Set by the server, never from request
+   * input; an unmanaged provider's catalog default leaves it unset.
+   */
+  managed?: boolean;
 }
 
 // ============================================================================
@@ -150,7 +202,13 @@ export interface TTSModelConfig {
  * Add new ASR providers here as union members.
  * Keep in sync with ASR_PROVIDERS registry in constants.ts
  */
-export type BuiltInASRProviderId = 'openai-whisper' | 'browser-native' | 'qwen-asr';
+export type BuiltInASRProviderId =
+  | 'openai-whisper'
+  | 'browser-native'
+  | 'qwen-asr'
+  | 'funasr-asr'
+  | 'lemonade-asr'
+  | 'azure-asr';
 
 export type ASRProviderId = BuiltInASRProviderId | `custom-asr-${string}`;
 
@@ -178,14 +236,29 @@ export interface ASRModelConfig {
   apiKey?: string;
   baseUrl?: string;
   language?: string;
+  /**
+   * Server-side outbound address policy (see {@link TTSModelConfig.publicOnly}).
+   * A client-supplied BYOK `baseUrl` sets this so the strict public policy wins.
+   */
+  publicOnly?: boolean;
+  /** Server-configured provider (see {@link TTSModelConfig.managed}). */
+  managed?: boolean;
 }
 
 /** Returns true if the provider ID is a user-defined custom TTS provider. */
 export function isCustomTTSProvider(id: string): boolean {
-  return id.startsWith('custom-tts-');
+  return typeof id === 'string' && id.startsWith('custom-tts-');
 }
 
 /** Returns true if the provider ID is a user-defined custom ASR provider. */
 export function isCustomASRProvider(id: string): boolean {
-  return id.startsWith('custom-asr-');
+  return typeof id === 'string' && id.startsWith('custom-asr-');
+}
+
+/** A provider-local voice catalogue configured by the deployment. */
+export interface ConfiguredTTSVoice {
+  id: string;
+  name: string;
+  language?: string;
+  gender?: 'male' | 'female' | 'neutral';
 }

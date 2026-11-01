@@ -1,6 +1,9 @@
 import tinycolor from 'tinycolor2';
 import { nanoid } from 'nanoid';
-import type { PPTElement, PPTLineElement, Slide } from '@/lib/types/slides';
+import type { PPTElement, PPTLineElement, Slide } from '@openmaic/dsl';
+import { getElementRange } from '@openmaic/renderer';
+
+export { getElementRange, getLineElementPath } from '@openmaic/renderer';
 
 interface RotatedElementData {
   left: number;
@@ -75,40 +78,6 @@ export const getRectRotatedOffset = (element: RotatedElementData) => {
 };
 
 /**
- * 计算元素在画布中的位置范围
- * @param element 元素信息
- */
-export const getElementRange = (element: PPTElement) => {
-  let minX, maxX, minY, maxY;
-
-  if (element.type === 'line') {
-    minX = element.left;
-    maxX = element.left + Math.max(element.start[0], element.end[0]);
-    minY = element.top;
-    maxY = element.top + Math.max(element.start[1], element.end[1]);
-  } else if ('rotate' in element && element.rotate) {
-    const { left, top, width, height, rotate } = element;
-    const { xRange, yRange } = getRectRotatedRange({
-      left,
-      top,
-      width,
-      height,
-      rotate,
-    });
-    minX = xRange[0];
-    maxX = xRange[1];
-    minY = yRange[0];
-    maxY = yRange[1];
-  } else {
-    minX = element.left;
-    maxX = element.left + element.width;
-    minY = element.top;
-    maxY = element.top + element.height;
-  }
-  return { minX, maxX, minY, maxY };
-};
-
-/**
  * 计算一组元素在画布中的位置范围
  * @param elementList 一组元素信息
  */
@@ -155,20 +124,28 @@ export interface AlignLine {
  * @param lines 一组对齐吸附线信息
  */
 export const uniqAlignLines = (lines: AlignLine[]) => {
-  const uniqLines: AlignLine[] = [];
-  lines.forEach((line) => {
-    const index = uniqLines.findIndex((_line) => _line.value === line.value);
-    if (index === -1) uniqLines.push(line);
-    else {
-      const uniqLine = uniqLines[index];
-      const rangeMin = Math.min(uniqLine.range[0], line.range[0]);
-      const rangeMax = Math.max(uniqLine.range[1], line.range[1]);
-      const range: [number, number] = [rangeMin, rangeMax];
-      const _line = { value: line.value, range };
-      uniqLines[index] = _line;
+  // Dedupe by `value` in O(n) via a Map keyed on value, instead of an
+  // O(n²) `findIndex` over the accumulating result. This runs on every
+  // drag/scale mousemove with one snap line per nearby element edge, so the
+  // quadratic version janks on element-dense canvases. A Map preserves
+  // first-occurrence insertion order (re-`set`-ting an existing key keeps its
+  // position), so the output order and merge semantics are unchanged.
+  const byValue = new Map<number, AlignLine>();
+  for (const line of lines) {
+    const existing = byValue.get(line.value);
+    if (!existing) {
+      byValue.set(line.value, line);
+    } else {
+      byValue.set(line.value, {
+        value: line.value,
+        range: [
+          Math.min(existing.range[0], line.range[0]),
+          Math.max(existing.range[1], line.range[1]),
+        ],
+      });
     }
-  });
-  return uniqLines;
+  }
+  return Array.from(byValue.values());
 };
 
 /**
@@ -213,36 +190,6 @@ export const createElementIdMap = (elements: PPTElement[]) => {
 export const getTableSubThemeColor = (themeColor: string) => {
   const rgba = tinycolor(themeColor);
   return [rgba.setAlpha(0.3).toRgbString(), rgba.setAlpha(0.1).toRgbString()];
-};
-
-/**
- * 获取线条元素路径字符串
- * @param element 线条元素
- */
-export const getLineElementPath = (element: PPTLineElement) => {
-  // Defensive: ensure start and end are arrays
-  const startArr = Array.isArray(element.start) ? element.start : [0, 0];
-  const endArr = Array.isArray(element.end) ? element.end : [100, 100];
-  const start = startArr.join(',');
-  const end = endArr.join(',');
-  if (element.broken) {
-    const mid = element.broken.join(',');
-    return `M${start} L${mid} L${end}`;
-  } else if (element.broken2) {
-    const { minX, maxX, minY, maxY } = getElementRange(element);
-    if (maxX - minX >= maxY - minY)
-      return `M${start} L${element.broken2[0]},${startArr[1]} L${element.broken2[0]},${endArr[1]} ${end}`;
-    return `M${start} L${startArr[0]},${element.broken2[1]} L${endArr[0]},${element.broken2[1]} ${end}`;
-  } else if (element.curve) {
-    const mid = element.curve.join(',');
-    return `M${start} Q${mid} ${end}`;
-  } else if (element.cubic) {
-    const [c1, c2] = element.cubic;
-    const p1 = c1.join(',');
-    const p2 = c2.join(',');
-    return `M${start} C${p1} ${p2} ${end}`;
-  }
-  return `M${start} L${end}`;
 };
 
 /**

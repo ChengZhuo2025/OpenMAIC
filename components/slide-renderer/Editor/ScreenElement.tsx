@@ -1,6 +1,6 @@
 'use client';
 
-import { ElementTypes, type PPTElement } from '@/lib/types/slides';
+import { ElementTypes, type PPTElement } from '@openmaic/dsl';
 import { useMemo } from 'react';
 
 import { BaseImageElement } from '../components/element/ImageElement/BaseImageElement';
@@ -14,14 +14,21 @@ import { BaseVideoElement } from '../components/element/VideoElement/BaseVideoEl
 import { BaseCodeElement } from '../components/element/CodeElement/BaseCodeElement';
 import { useSceneSelector } from '@/lib/contexts/scene-context';
 import type { SceneContent } from '@/lib/types/stage';
+import { maicElementIdAttributes, screenElementDomId } from '../element-dom';
 
 interface ScreenElementProps {
   readonly elementInfo: PPTElement;
   readonly elementIndex: number;
   readonly animate?: boolean;
+  readonly selectable?: boolean;
 }
 
-export function ScreenElement({ elementInfo, elementIndex, animate }: ScreenElementProps) {
+export function ScreenElement({
+  elementInfo,
+  elementIndex,
+  animate,
+  selectable,
+}: ScreenElementProps) {
   const CurrentElementComponent = useMemo(() => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- element components have varying prop signatures
     const elementTypeMap: Record<string, any> = {
@@ -59,14 +66,19 @@ export function ScreenElement({ elementInfo, elementIndex, animate }: ScreenElem
   return (
     <div
       className="screen-element"
-      id={`screen-element-${elementInfo.id}`}
+      id={screenElementDomId(elementInfo.id)}
+      {...maicElementIdAttributes(elementInfo.id)}
       style={{
         zIndex: elementIndex,
         color: theme.fontColor,
         fontFamily: theme.fontName,
       }}
     >
-      <CurrentElementComponent elementInfo={elementInfo} animate={animate} />
+      <CurrentElementComponent
+        elementInfo={elementInfo}
+        animate={animate}
+        selectable={selectable}
+      />
     </div>
   );
 }

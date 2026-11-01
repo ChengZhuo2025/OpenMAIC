@@ -2,7 +2,20 @@
  * Web Search Provider Constants
  */
 
-import type { WebSearchProviderId, WebSearchProviderConfig } from './types';
+import { FIRECRAWL_DEFAULT_BASE_URL, FIRECRAWL_OFFICIAL_BASE_URLS } from './firecrawl-endpoint';
+import type { BaiduSubSources, WebSearchProviderId, WebSearchProviderConfig } from './types';
+
+/** The provider a search that names none means when the server configures none. */
+export const DEFAULT_WEB_SEARCH_PROVIDER_ID: WebSearchProviderId = 'tavily';
+
+/** Curated model list offered in the Claude web-search settings. */
+export const CLAUDE_WEB_SEARCH_MODELS: ReadonlyArray<{ id: string; name: string }> = [
+  { id: 'claude-opus-5', name: 'Claude Opus 5' },
+  { id: 'claude-sonnet-5', name: 'Claude Sonnet 5' },
+  { id: 'claude-opus-4-6', name: 'Claude Opus 4.6' },
+  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
+  { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5' },
+];
 
 /**
  * Web Search Provider Registry
@@ -13,12 +26,234 @@ export const WEB_SEARCH_PROVIDERS: Record<WebSearchProviderId, WebSearchProvider
     name: 'Tavily',
     requiresApiKey: true,
     defaultBaseUrl: 'https://api.tavily.com',
+    endpointPath: '/search',
+    icon: '/logos/tavily.svg',
+  },
+  exa: {
+    id: 'exa',
+    name: 'Exa',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://api.exa.ai',
+    endpointPath: '/search',
+  },
+  firecrawl: {
+    id: 'firecrawl',
+    name: 'Firecrawl',
+    // Shares the `firecrawl` provider (one key and base URL) with web fetch.
+    officialBaseUrls: FIRECRAWL_OFFICIAL_BASE_URLS,
+    requiresApiKey: true,
+    defaultBaseUrl: FIRECRAWL_DEFAULT_BASE_URL,
+    endpointPath: '/v2/search',
+  },
+  bocha: {
+    id: 'bocha',
+    name: 'Bocha',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://api.bocha.cn',
+    endpointPath: '/v1/web-search',
+    icon: '/logos/bocha.png',
+  },
+  brave: {
+    id: 'brave',
+    name: 'Brave Search',
+    requiresApiKey: false,
+    defaultBaseUrl: 'https://search.brave.com',
+    endpointPath: '/search',
+    icon: '/logos/brave.png',
+  },
+  baidu: {
+    id: 'baidu',
+    name: 'Baidu',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://qianfan.baidubce.com',
+    endpointPath: '/v2/ai_search/web_search',
+    icon: '/logos/baidu.png',
+  },
+  claude: {
+    id: 'claude',
+    name: 'Claude',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://api.anthropic.com/v1',
+    endpointPath: '/messages',
+    icon: '/logos/claude.svg',
+    models: CLAUDE_WEB_SEARCH_MODELS,
+  },
+  kimi: {
+    id: 'kimi',
+    name: 'Kimi',
+    sharedChatProviderId: 'kimi',
+    enableEnvVar: 'WEB_SEARCH_KIMI_ENABLED',
+    officialBaseUrls: [
+      'https://api.moonshot.cn/v1',
+      'https://api.moonshot.ai/v1',
+      'https://api.kimi.com/coding/v1',
+      'https://api.kimi.ai/coding/v1',
+    ],
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://api.moonshot.cn/v1',
+    endpointPath: '/tools/search_pro',
+    icon: '/logos/kimi.png',
+  },
+  minimax: {
+    id: 'minimax',
+    name: 'MiniMax',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://api.minimaxi.com',
+    endpointPath: '/v1/coding_plan/search',
+    icon: '/logos/minimax.svg',
+  },
+  doubao: {
+    id: 'doubao',
+    name: 'Doubao',
+    requiresApiKey: true,
+    // 豆包搜索 Custom 版: the Agent Plan key authenticates directly here
+    // (verified). The MCP/Skill path wraps this same REST endpoint.
+    defaultBaseUrl: 'https://open.feedcoopapi.com',
+    endpointPath: '/search_api/web_search',
+    icon: '/logos/doubao.svg',
+  },
+  searxng: {
+    id: 'searxng',
+    name: 'SearXNG',
+    requiresApiKey: false,
+    requiresBaseUrl: true,
+    endpointPath: '/search',
+  },
+  deepseek: {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    sharedChatProviderId: 'deepseek',
+    enableEnvVar: 'WEB_SEARCH_DEEPSEEK_ENABLED',
+    officialBaseUrls: ['https://api.deepseek.com', 'https://api.deepseek.com/v1'],
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://api.deepseek.com/v1',
+    endpointPath: '/tools/search',
+    icon: '/logos/deepseek.svg',
   },
 };
+
+/** Default model for Claude web search (Sonnet tier: balanced speed/cost for search + summarize). */
+export const CLAUDE_WEB_SEARCH_DEFAULT_MODEL = 'claude-sonnet-5';
+
+export function isWebSearchProviderConfigured(
+  provider: WebSearchProviderConfig,
+  cfg?: {
+    apiKey?: string;
+    baseUrl?: string;
+    isServerConfigured?: boolean;
+    serverDisabled?: boolean;
+  },
+): boolean {
+  if (cfg?.serverDisabled) return false;
+  if (cfg?.isServerConfigured) return true;
+  // SearXNG base URLs are operator-managed only; client settings must not count.
+  if (provider.id === 'searxng') return false;
+  if (provider.requiresApiKey) return !!cfg?.apiKey;
+  if (provider.requiresBaseUrl) return !!cfg?.baseUrl;
+  return true;
+}
+
+function isWebSearchConfigUsable(
+  providerId: WebSearchProviderId,
+  cfg?: {
+    apiKey?: string;
+    baseUrl?: string;
+    isServerConfigured?: boolean;
+    requiresApiKey?: boolean;
+    serverDisabled?: boolean;
+  },
+): boolean {
+  if (!cfg) return false;
+  if (cfg.serverDisabled) return false;
+  if (cfg.isServerConfigured) return true;
+
+  const provider = WEB_SEARCH_PROVIDERS[providerId];
+  if (providerId === 'searxng') return false;
+  const requiresApiKey = cfg.requiresApiKey ?? provider.requiresApiKey;
+  if (!requiresApiKey) {
+    if (provider.requiresBaseUrl) return !!cfg.baseUrl;
+    return true;
+  }
+  return !!cfg.apiKey;
+}
+
+/** Server-managed providers first, then other usable client providers. */
+export function buildWebSearchFallbackOrder(
+  config: Partial<
+    Record<
+      WebSearchProviderId,
+      {
+        apiKey?: string;
+        baseUrl?: string;
+        isServerConfigured?: boolean;
+        requiresApiKey?: boolean;
+        serverDisabled?: boolean;
+      }
+    >
+  >,
+): WebSearchProviderId[] {
+  const ids = Object.keys(WEB_SEARCH_PROVIDERS) as WebSearchProviderId[];
+  const serverManaged = ids.filter(
+    (id) => isWebSearchConfigUsable(id, config[id]) && config[id]?.isServerConfigured,
+  );
+  const clientUsable = ids.filter(
+    (id) => isWebSearchConfigUsable(id, config[id]) && !config[id]?.isServerConfigured,
+  );
+  return [...serverManaged, ...clientUsable];
+}
+
+export const BAIDU_SUB_SOURCES: Record<
+  keyof BaiduSubSources,
+  { labelKey: string; descriptionKey: string; docsUrl?: string }
+> = {
+  webSearch: {
+    labelKey: 'settings.baiduSubSourceWeb',
+    descriptionKey: 'settings.baiduSubSourceWebDescription',
+    docsUrl: 'https://cloud.baidu.com/doc/qianfan/s/Mmh4sv6ec',
+  },
+  baike: {
+    labelKey: 'settings.baiduSubSourceBaike',
+    descriptionKey: 'settings.baiduSubSourceBaikeDescription',
+    docsUrl: 'https://ai.baidu.com/ai-doc/AppBuilder/rmckc6mtu',
+  },
+  scholar: {
+    labelKey: 'settings.baiduSubSourceScholar',
+    descriptionKey: 'settings.baiduSubSourceScholarDescription',
+    docsUrl: 'https://cloud.baidu.com/doc/qianfan/s/Amkw9qpzd',
+  },
+};
+
+export function getWebSearchProviderDisplayName(
+  providerId: WebSearchProviderId,
+  t?: (key: string) => string,
+): string {
+  const provider = WEB_SEARCH_PROVIDERS[providerId];
+  if (!provider) return providerId;
+
+  if (t) {
+    const key = `settings.providerNames.${providerId}`;
+    const translated = t(key);
+    if (translated && translated !== key) return translated;
+  }
+
+  return provider.name;
+}
 
 /**
  * Get all available web search providers
  */
 export function getAllWebSearchProviders(): WebSearchProviderConfig[] {
   return Object.values(WEB_SEARCH_PROVIDERS);
+}
+
+/** Whether a shared search account's typed base is one of its official endpoints. */
+export function isOfficialWebSearchBaseUrl(providerId: string, baseUrl?: string): boolean {
+  const allowed = WEB_SEARCH_PROVIDERS[providerId as WebSearchProviderId]?.officialBaseUrls;
+  if (!allowed || !baseUrl) return true;
+  try {
+    const normalized = new URL(baseUrl.trim()).toString().replace(/\/+$/, '');
+    return allowed.includes(normalized);
+  } catch {
+    return false;
+  }
 }

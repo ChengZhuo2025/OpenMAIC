@@ -1,0 +1,61 @@
+import type { Queryable } from '@openmaic/storage/document/pg';
+import { withSessionAdvisoryLock } from '@openmaic/storage/pg-migrations';
+import type { ConnectableQueryable } from '@openmaic/storage/server/reference';
+
+/**
+ * PostgreSQL advisory-lock key serializing schema bootstrap across processes.
+ * Any fixed value works; it only has to be the same in every instance of this
+ * application and distinct from the keys the storage package's test suites
+ * take.
+ */
+export const SCHEMA_BOOTSTRAP_LOCK_KEY = 71_310_523;
+
+/**
+ * Run a schema bootstrap with every other instance's bootstrap held off.
+ *
+ * `CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS` and
+ * `CREATE OR REPLACE FUNCTION` are not atomic across sessions: two instances
+ * starting together against the same database can both decide an object is
+ * missing and one fails on the catalog's unique index (or with "tuple
+ * concurrently updated"), which answers its first request with a 500. The
+ * statements are idempotent one at a time, so running the bootstraps one
+ * after another is all it takes.
+ *
+ * The lock is session-level and taken on one dedicated connection, which runs
+ * every statement of `body` and is released in `finally`: the lock cannot be
+ * held by a connection that went back to the pool, and a connection that dies
+ * mid-bootstrap releases it with the session. Each store's versioned
+ * migrations (`applySchemaMigrations` in `@openmaic/storage/pg-migrations`)
+ * are serialized on their own as well; this lock, at the application's
+ * bootstrap, serializes the whole sequence -- package tables and this
+ * application's own (`stage_meta`, owner materials) alike, where one store's
+ * migrations depend on another's tables -- and every caller that provisions
+ * schema goes through this one helper.
+ *
+ * Session-level advisory locks need a direct or session-pooled connection; a
+ * pooler in transaction mode (PgBouncer `pool_mode = transaction`) is not
+ * supported.
+ */
+export async function withSchemaBootstrapLock<T>(
+  pool: ConnectableQueryable,
+  body: (queryable: Queryable) => Promise<T>,
+  options: { lockTimeoutMs?: number } = {},
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    // Bounded: a holder that never finishes fails this start with an error
+    // naming the lock (SchemaLockTimeoutError) instead of hanging it. A failed
+    // unlock after a failed body is logged; the body's error is the one thrown.
+    return await withSessionAdvisoryLock(
+      client,
+      SCHEMA_BOOTSTRAP_LOCK_KEY,
+      {
+        name: 'schema bootstrap lock',
+        ...(options.lockTimeoutMs === undefined ? {} : { timeoutMs: options.lockTimeoutMs }),
+      },
+      () => body(client),
+    );
+  } finally {
+    client.release();
+  }
+}

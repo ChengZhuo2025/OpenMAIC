@@ -7,7 +7,7 @@
  * Request format (text-to-video):
  *   POST /api/v3/contents/generations/tasks
  *   {
- *     "model": "doubao-seedance-1-5-pro-251215",
+ *     "model": "doubao-seedance-2-0-260128",
  *     "content": [{ "type": "text", "text": "prompt here" }],
  *     "ratio": "16:9",
  *     "duration": 5,
@@ -16,10 +16,12 @@
  *   }
  *
  * Supported models:
- * - doubao-seedance-1-5-pro-251215     (latest, 4~12s)
- * - doubao-seedance-1-0-pro-250528     (stable, 2~12s)
- * - doubao-seedance-1-0-pro-fast-251015 (faster, 2~12s)
- * - doubao-seedance-1-0-lite-t2v-250428 (lightweight, 2~12s)
+ * - doubao-seedance-2-0-260128
+ * - doubao-seedance-2-0-fast-260128
+ * - doubao-seedance-2-0-mini-260615
+ * - doubao-seedance-1-0-pro-250528
+ * - doubao-seedance-1-0-pro-fast-251015
+ * - doubao-seedance-1-0-lite-t2v-250428
  *
  * API docs: https://www.volcengine.com/docs/6492/2165104
  */
@@ -29,10 +31,29 @@ import type {
   VideoGenerationOptions,
   VideoGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import { probeAuth } from '../probe-auth';
+import { runPolledTask, type PolledTaskControl } from '../polled-task';
+import { assertNotRedirected } from '../redirect-guard';
+import { requireModel } from '../require-model';
 
-const DEFAULT_MODEL = 'doubao-seedance-1-5-pro-251215';
 const DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com';
 const POLL_INTERVAL_MS = 5000;
+
+/**
+ * Resolves the Ark API root. A bare host gets the standard `/api/v3` appended; a
+ * baseUrl that already carries an `/api/...` path (e.g. a token plan's
+ * `https://ark.cn-beijing.volces.com/api/plan/v3`) is used verbatim.
+ */
+function resolveArkRoot(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  return /\/api\//.test(trimmed) ? trimmed : `${trimmed}/api/v3`;
+}
+
+/** The Ark API root a configured base URL (or none, the default host) reaches. */
+export function seedanceApiRoot(baseUrl?: string): string {
+  return resolveArkRoot(baseUrl || DEFAULT_BASE_URL);
+}
 const MAX_POLL_ATTEMPTS = 60; // 5 minutes max
 
 /** Response shape for task creation (only returns id) */
@@ -109,26 +130,18 @@ export async function testSeedanceConnectivity(
   config: VideoGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
-  try {
-    const response = await fetch(
-      `${baseUrl}/api/v3/contents/generations/tasks/connectivity-test-nonexistent`,
-      {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${config.apiKey}` },
-      },
-    );
-    // 401/403 means key invalid; anything else (404, 400, 200) means key works
-    if (response.status === 401 || response.status === 403) {
-      const text = await response.text();
-      return {
-        success: false,
-        message: `Seedance auth failed (${response.status}): ${text}`,
-      };
-    }
-    return { success: true, message: 'Connected to Seedance' };
-  } catch (err) {
-    return { success: false, message: `Seedance connectivity error: ${err}` };
-  }
+  return probeAuth({
+    providerName: 'Seedance',
+    request: () =>
+      mediaFetchFor(config)(
+        `${resolveArkRoot(baseUrl)}/contents/generations/tasks/connectivity-test-nonexistent`,
+        {
+          method: 'GET',
+          redirect: 'manual',
+          headers: { Authorization: `Bearer ${config.apiKey}` },
+        },
+      ),
+  });
 }
 
 export async function submitSeedanceTask(
@@ -138,7 +151,7 @@ export async function submitSeedanceTask(
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
 
   const body: Record<string, unknown> = {
-    model: config.model || DEFAULT_MODEL,
+    model: requireModel(config.model, 'Seedance'),
     content: [
       {
         type: 'text',
@@ -156,14 +169,20 @@ export async function submitSeedanceTask(
   const resolution = toSeedanceResolution(options.resolution);
   if (resolution) body.resolution = resolution;
 
-  const response = await fetch(`${baseUrl}/api/v3/contents/generations/tasks`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${config.apiKey}`,
+  const response = await mediaFetchFor(config)(
+    `${resolveArkRoot(baseUrl)}/contents/generations/tasks`,
+    {
+      method: 'POST',
+      redirect: 'manual',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+      body: JSON.stringify(body),
     },
-    body: JSON.stringify(body),
-  });
+  );
+
+  assertNotRedirected(response, 'Seedance');
 
   if (!response.ok) {
     const text = await response.text();
@@ -189,12 +208,18 @@ export async function pollSeedanceTask(
 ): Promise<VideoGenerationResult | null> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
 
-  const response = await fetch(`${baseUrl}/api/v3/contents/generations/tasks/${taskId}`, {
-    method: 'GET',
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
+  const response = await mediaFetchFor(config)(
+    `${resolveArkRoot(baseUrl)}/contents/generations/tasks/${taskId}`,
+    {
+      method: 'GET',
+      redirect: 'manual',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
     },
-  });
+  );
+
+  assertNotRedirected(response, 'Seedance');
 
   if (!response.ok) {
     const text = await response.text();
@@ -230,16 +255,22 @@ export async function pollSeedanceTask(
 export async function generateWithSeedance(
   config: VideoGenerationConfig,
   options: VideoGenerationOptions,
+  control?: PolledTaskControl,
 ): Promise<VideoGenerationResult> {
-  const taskId = await submitSeedanceTask(config, options);
-
-  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-    const result = await pollSeedanceTask(config, taskId);
-    if (result) return result;
-  }
-
-  throw new Error(
-    `Seedance video generation timed out after ${(MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS) / 1000}s (task: ${taskId})`,
-  );
+  return runPolledTask<VideoGenerationResult>({
+    submit: async () => ({
+      status: 'submitted',
+      taskId: await submitSeedanceTask(config, options),
+    }),
+    poll: async (taskId) => {
+      const result = await pollSeedanceTask(config, taskId);
+      return result ? { status: 'done', result } : { status: 'pending' };
+    },
+    intervalMs: POLL_INTERVAL_MS,
+    maxAttempts: MAX_POLL_ATTEMPTS,
+    label: 'Seedance video generation',
+    control,
+    formatTimeout: ({ taskId, elapsedMs }) =>
+      `Seedance video generation timed out after ${elapsedMs / 1000}s (task: ${taskId})`,
+  });
 }

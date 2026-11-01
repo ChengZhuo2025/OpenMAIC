@@ -1,0 +1,175 @@
+---
+title: 部署
+description: 用 Docker 部署 OpenMAIC，或在你自己的主机上用 pnpm start 运行。
+---
+
+OpenMAIC 是一个 Next.js 应用，需要一个常驻的 Node.js 进程和 PostgreSQL。课程生成在服务端进行：每次生成都作为记录保存在数据库中，由服务进程内的 worker 执行；浏览器离开页面后生成仍会继续，进程退出后由另一个进程（或重启后的同一进程）从最近完成的步骤接手。支持两种部署方式：
+
+- **Docker Compose**（推荐）：应用和 PostgreSQL 两个容器。
+- **Docker 镜像或 `pnpm start`**，搭配你自己运行的 PostgreSQL。
+
+从 1.2.0 起不再支持 Vercel 等 Serverless 平台：随请求结束的函数无法运行一次生成。见下文「Vercel（1.1.x 及以前）」。
+
+## Docker
+
+仓库里有一份适合生产的 `Dockerfile`。镜像内部使用 Node.js 22，构建并运行：
+
+```bash
+docker build -t openmaic .
+
+docker run --env-file .env.local -e DATABASE_URL=postgres://user:password@db-host:5432/openmaic -v openmaic-data:/app/data -p 3000:3000 openmaic
+```
+
+推荐使用仓库里的 Docker Compose 配置：
+
+```bash
+cp .env.example .env.local
+# 编辑 .env.local（key 和服务端选项），然后：
+docker compose up --build
+```
+
+默认 Compose 部署会启动 OpenMAIC 应用和 PostgreSQL 两个容器，自动配置两者之间的 `DATABASE_URL`，并挂载 `openmaic-data` 与 `openmaic-postgres` 数据卷。其他 provider 和功能按需配置，详见[配置说明](./configuration.mdx)。
+
+模型有两种配置方式。个人安装时，启动服务后打开应用，在模型设置中接入模型服务，配置保存在数据库中。如果希望以文件方式管理部署，把 `openmaic.example.yml` 复制为 `openmaic.yml`，key 放在 `.env.local` 中，再挂载该文件（见下文）。详见[配置说明](./configuration.mdx#模型与服务商)。
+
+镜像会以运行用户的身份创建数据卷中的数据目录，因此新建的数据卷可以直接持久化课程和用量记录。旧版镜像创建的数据卷可能归 root 所有，这会让所有服务端保存都因 `EACCES` 失败，而应用仍照常提供服务（课程悄无声息地从未写入磁盘；日志中出现 `Failed to record usage ... EACCES: permission denied`）。请修复一次这样的数据卷，然后重启应用：
+
+```bash
+docker exec -u root <container> chown -R 1001:1001 /app/data
+```
+
+`NEXT_PUBLIC_*` 功能开关会在 Docker 构建时注入，不能只写在运行时的 `.env.local` 中。例如启用视频导出和实验性 PPTX 导入：
+
+```bash
+NEXT_PUBLIC_ENABLE_VIDEO_EXPORT=true \
+NEXT_PUBLIC_ENABLE_PPTX_IMPORT=true \
+docker compose --profile video-export up --build
+```
+
+其他客户端功能开关也可以用同样方式传入。若使用 `docker build`，请改用对应的 `--build-arg`。
+
+使用 `openmaic.yml` 时，把它挂载到应用的工作目录；也可以挂载到其他位置，并用 `OPENMAIC_CONFIG` 指向它：
+
+```yaml
+services:
+  openmaic:
+    volumes:
+      - ./openmaic.yml:/app/openmaic.yml:ro
+```
+
+不要挂载宿主机上不存在的路径：Docker 会在该位置创建一个目录，导致服务拒绝启动。使用 `docker run` 时，添加 `-v "$PWD/openmaic.yml:/app/openmaic.yml:ro"`。修改文件后需要重启容器。`openmaic.yml` 已列入 `.dockerignore`，不会被打包进从仓库构建的镜像：请在运行时挂载它。没有 `openmaic.yml` 时，仍会从 `/app/server-providers.yml` 读取旧版的 `server-providers.yml`。
+
+Docker 容器中的 `localhost` 指向容器自身。若 Ollama、Lemonade、VoxCPM 或 ComfyUI 运行在宿主机上，请使用 `host.docker.internal`，例如 `http://host.docker.internal:11434/v1` 或 `http://host.docker.internal:8188`。Linux Docker 通常还需要为 `openmaic` 服务添加 `extra_hosts: ["host.docker.internal:host-gateway"]`。在 `openmaic.yml`（或旧版变量）中声明的服务商由服务端托管，其端点可以位于宿主机或内网，无需 `ALLOW_LOCAL_NETWORKS`。该变量只影响用户自行填写的端点：在 **设置 → 模型服务** 中添加的对话 Base URL，以及已弃用的请求字段。
+
+## 自建虚拟机
+
+主机需要 Node.js `22.19.0` 或更高版本，以及 pnpm `10.28.0`。用 `pnpm` 构建并启动：
+
+```bash
+pnpm install
+pnpm build
+DATABASE_URL=postgres://user:password@db-host:5432/openmaic pnpm start      # 默认监听 3000 端口
+```
+
+请用进程管理器（systemd、pm2 或容器）保持服务运行并在退出后自动重启，前面套 nginx 或 Caddy 做 TLS 终止。课程和生成的课程媒体保存在 PostgreSQL（或 S3）中，因此多个实例可以共用同一个数据库，前提是它们同时共用数据目录和相同的 `OPENMAIC_SECRET_KEY`（见下文）。
+
+`pnpm start` 运行的是 `next start`，它会警告说自己不适用于 `output: standalone` 配置。这个警告可以忽略：`next start` 会从 `.next` 提供完整的构建产物。Docker 镜像运行的是 standalone 服务器（`node server.js`），但该服务器会把工作目录切换到它自己所在的目录，所以在虚拟机上请继续使用 `pnpm start`，它会从启动目录读取 `data/` 和 `openmaic.yml`。
+
+## 必需配置
+
+| 配置 | Docker Compose | Docker 镜像或 `pnpm start` |
+| --- | --- | --- |
+| `DATABASE_URL` | 已指向自带的 PostgreSQL | 必填；没有它服务会在启动时退出 |
+| 身份模式 | 单用户（`docker-compose.defaults.env` 中的 `OWNER_SINGLE_USER=true`） | 不设置时，每个浏览器是一个匿名所有者 |
+| `OPENMAIC_SECRET_KEY` | 可选：生成的密钥保存在 `openmaic-data` 卷中 | 多个实例，或没有持久化 `data/` 目录时必填 |
+| 数据目录 | 挂载在 `/app/data` 的 `openmaic-data` 卷 | 工作目录下持久化的 `data/` 目录，所有实例共用 |
+| 模型 | `openmaic.yml` 或 **设置 → 模型** | 同左 |
+
+**身份模式**决定课程归谁所有。不设置时，每个浏览器都是独立的匿名所有者，换一个浏览器看到的是空课程库。个人安装请设置 `OWNER_SINGLE_USER=true`；一个团队共用一个课程库时，设置 `PERSISTENCE_SHARED_OWNER_ID` 并配合 `ACCESS_CODE`；需要真实账号时，注册所有者认证方法。详见 [Owner identity](./hosting.mdx#owner-identity) 和 `.env.example`。
+
+匿名模式下，所有者 cookie 在生产环境中带有 `Secure` 标记，`ACCESS_CODE` 的 cookie 也是如此。浏览器只在 HTTPS 或 `http://localhost` 上保存 `Secure` cookie（Safari 连 localhost 也不保存），因此通过纯 HTTP 提供服务的部署必须设置 `COOKIE_SECURE=0`（必须正好是 `0`）：否则每个请求都会成为新的所有者，写入以 `403` 失败，访问码也会被反复要求输入。没有 TLS 时 cookie 以明文传输，只应在可信网络中这样做。
+
+在 `localhost` 以外的地址上使用纯 HTTP（局域网 IP、Tailscale IP 或 MagicDNS 域名）同样不是安全上下文，浏览器没有 Web Locks API。OpenMAIC 在这种情况下仍然会保存，但同一课程的多个标签页之间不做协调：如果两个标签页修改同一个对话，以最后一次保存为准；在一个标签页删除的对话会保持删除，即使另一个标签页当时仍在编辑它。在局域网内用手机或平板访问时，建议使用 HTTPS，例如在服务前面用 `tailscale serve`。
+
+**`OPENMAIC_SECRET_KEY`** 用于加密在模型设置中保存的服务商 key。不设置时，每个实例会在 `data/instance-secret.key` 中生成自己的密钥，共用数据库的实例之间就无法读取彼此保存的 key。请把它和数据库备份放在一起，见[密钥与 OPENMAIC_SECRET_KEY](./configuration.mdx#密钥与-openmaic_secret_key)。
+
+**多个实例**共用数据库时，还需要共用同一个持久化数据目录（工作目录下的 `data/`，镜像中为 `/app/data`；例如在每个实例上挂载同一个卷或网络文件系统）。课程文档和生成的课程媒体保存在 PostgreSQL（设置 `ASSET_S3_BUCKET` 时为 S3）中，但每个进程会把以下文件放在自己的数据目录里：上传的资料文件及其提取结果、由智能体编辑的课程的讲解与资料媒体（`data/classrooms`，或 `OPENMAIC_CLASSROOMS_DIR`）、用量记录（`data/usage`）以及自动生成的实例密钥。由另一个实例接手的生成任务会从这里读取上传的资料。
+
+## 生成任务
+
+每个服务进程都运行一个生成 worker，与 `OPENMAIC_AGENT_RUNTIME_ENABLED` 无关。以下变量用于调整它（取值为正整数）：
+
+| 变量 | 默认值 | 含义 |
+| --- | --- | --- |
+| `OPENMAIC_MAX_ACTIVE_RUNS_PER_OWNER` | `2` | 每个所有者同时进行中的生成数。等待确认大纲、或因步骤失败而暂停的生成不计入。超出时，开始、确认大纲或重试会返回 `429 ACTIVE_RUN_LIMIT`。 |
+| `OPENMAIC_MAX_WAITING_RUNS_PER_OWNER` | `10` | 每个所有者同时等待确认大纲的生成数。 |
+| `OPENMAIC_GENERATION_RUN_MAX_CONCURRENT` | `4` | 单个进程同时执行的生成数。 |
+| `OPENMAIC_GENERATION_RUN_STREAMS_PER_OWNER` | `16` | 每个所有者在单个进程上可同时打开的生成事件流数。 |
+| `OPENMAIC_GENERATION_RUN_RETENTION_HOURS` | `24` | 已结束的生成保留完整事件日志的时长（小时），之后会被压缩。 |
+
+生成任务与 agent 运行时共用租约时间配置（`OPENMAIC_AGENT_RUNTIME_SCAN_INTERVAL_MS`、`_HEARTBEAT_MS`、`_LEASE_TTL_MS`、`_MAX_ATTEMPTS`，见 `.env.example`）。服务停止或重启时（包括滚动更新），其中的生成会由另一个实例或重新启动的同一实例从最后完成的步骤继续：进度会暂停约一个租约有效期（默认 10 秒），进行中的步骤会重新生成。一个生成连续被中断 `OPENMAIC_AGENT_RUNTIME_MAX_ATTEMPTS` 次（默认 5 次）且期间没有完成任何步骤时，会在该步骤暂停并提供重试；如果多实例滚动更新会达到这个次数，请调大它。
+
+## 服务端持久化（PostgreSQL）
+
+OpenMAIC 把课程、对话历史、学习进度和生成的媒体保存在 PostgreSQL 中，**必须提供 `DATABASE_URL`**：没有它服务会输出 `[boot] Invalid server configuration; the server will not start: DATABASE_URL is not set. ...` 及修复方法，并以退出码 `1` 退出。持久化 HTTP API 内嵌在 OpenMAIC 中，不需要额外的 persistence 服务。
+
+`docker compose up` 会在应用旁启动 PostgreSQL 并为其设置 `DATABASE_URL`。本地开发时，`pnpm db:up` 以同一服务定义启动一个独立的开发数据库（单独的 Compose 项目和数据卷 `openmaic-dev-db`，本机所有检出共用，不会影响该栈的数据库），并发布到 `127.0.0.1`（端口 `OPENMAIC_DB_PORT`，默认 `5432`）；`pnpm db:down` 可将其停止。然后在 `.env.local` 中设置连接：
+
+```bash
+DATABASE_URL=postgres://openmaic:openmaic-dev@127.0.0.1:5432/openmaic
+```
+
+持久化不再有单独的凭证：每个请求都归属于所有者解析得出的所有者（默认是每个浏览器一个的匿名 cookie），运行时会话和媒体按该所有者分区。默认身份只隔离浏览器、并不认证任何人，面向真实用户的部署应注册基于自有账号体系的所有者认证方法。早期版本使用的 `PERSISTENCE_DEV_TOKEN` / `NEXT_PUBLIC_PERSISTENCE_TOKEN` 已移除并被忽略；按旧的浏览器自生成学习者 key 存储的运行时会话将无法再访问。如果 `PERSISTENCE_DEV_TOKEN` 曾是唯一的访问门槛，请在升级前用 `ACCESS_CODE` 或网关保护部署，或注册所有者认证方法。
+
+PostgreSQL 数据保存在 `openmaic-postgres` volume 中。`PERSISTENCE_POSTGRES_PASSWORD` 只会在数据库目录首次初始化时设置密码，之后修改环境变量不会自动修改已有数据库用户密码。
+
+除非设置了 `OPENMAIC_SECRET_KEY`，`openmaic-data` 数据卷中还保存着 `instance-secret.key`，即自动生成的实例密钥，用于加密模型设置中保存的服务商 key。请把它和数据库一起备份：没有它，已保存的 key 需要重新填写。如果运行多个副本、没有持久化数据卷或文件系统只读，请改为设置 `OPENMAIC_SECRET_KEY`（所有副本使用同一个值）；参见 [密钥与 OPENMAIC_SECRET_KEY](./configuration.mdx#密钥与-openmaic_secret_key)。
+
+早期版本可以把课程保存在浏览器（IndexedDB）中。该模式已移除，`NEXT_PUBLIC_PERSISTENCE` 构建变量会被忽略。以这种方式保存在浏览器中的课程，会在该浏览器首次打开升级后的应用时自动搬到服务端：单向导入器把它们（连同对话、学习进度、文件夹和媒体）复制给服务端为该浏览器解析出的所有者，浏览器中的原始数据保持不变。每个浏览器只导入一次：服务端把该浏览器绑定给第一个加载升级后应用的所有者，认领会把绑定带到账号（匿名所有者在登录时被认领进账号）。服务端会拒绝导入器为其他所有者发出的请求，因此之后在同一浏览器中使用的其他所有者不会得到任何导入。整个过程无需操作，也没有界面提示；如有问题，会以 `[legacy-browser-import]` 前缀记录在浏览器控制台中。
+
+## 从 1.1.x 升级
+
+| 部署方式 | 操作 |
+| --- | --- |
+| `docker compose` | 拉取新版本，运行 `docker compose up --build`。把模型设置迁到 `openmaic.yml` 或 **设置 → 模型**（没有 `openmaic.yml` 时，服务商环境变量仍然有效），并把 `MODEL_ROUTES` 改写为槽位：设置了它却没有 `openmaic.yml` 的服务会拒绝启动。在每个存有本地课程的浏览器中打开一次应用，完成导入。 如果 `.env.local` 设置了 `PERSISTENCE_SHARED_OWNER_ID`，还要设置 `OWNER_SINGLE_USER=false`：Compose 现在默认以单用户模式启动。此前的服务端部署中属于匿名所有者的课程不会自动合并给单用户，需要在创建它们的每个浏览器中用 `POST /api/identity/claim` 认领（打开浏览器只会导入它在本地保存的数据）。 |
+| `pnpm start` + 自己的 PostgreSQL | 停止服务，拉取新版本，运行 `pnpm install` 和 `pnpm build`，然后在同一个工作目录里用 `pnpm start` 重新启动，这样会保留 `data/`。设置 `DATABASE_URL`、身份模式；多个实例共用数据库时设置 `OPENMAIC_SECRET_KEY`，并且多个实例还需要共用同一个数据目录（见[必需配置](#必需配置)）。模型设置、`MODEL_ROUTES` 和浏览器中的课程同上一行。 |
+| Vercel | 留在 1.1.x，或迁移到使用同一数据库的常驻主机（见下文）。 |
+| Skill / API | 按更新后的 `openmaic` skill 操作：以同一所有者上传资料、提交并轮询。 |
+
+首次启动 1.2.0 之前：
+
+- **保留数据目录。** 启动 1.2.0 时，工作目录里要有原来的 `data/`（或使用相同的 `OPENMAIC_CLASSROOMS_DIR`）；使用 Compose 时沿用同一个 `openmaic-data` 卷。1.1.x 以文件形式保存在 `data/classrooms` 下的课堂，会在启动后于后台导入数据库一次；没有这个目录的服务器没有可导入的内容。
+- **先设置身份模式。** 导入时，这些课堂归属于那次启动时配置的所有者：设置了单用户（`OWNER_SINGLE_USER=true`）或团队共享所有者（`PERSISTENCE_SHARED_OWNER_ID`）时归它们所有；否则（匿名模式）归专用所有者 `system:legacy-classrooms`，此时它们只能通过原链接以只读方式打开，也不会出现在任何课程库中。每个课堂只导入一次，所以在匿名模式下导入的课堂，之后即使再设置身份模式，也仍然属于 `system:legacy-classrooms`。
+- **列出模型。** 每个使用服务端托管凭据、并把所选模型发往上游的服务商（对话、图像、视频、语音合成、语音识别、基于模型的联网搜索）都需要显式的模型列表（`*_MODELS`，或 `openmaic.yml`、`server-providers.yml` 中该服务商下的 `models`）。没有列表时，只有默认模型、回退模型和槽位引用的模型获得授权；启动日志会逐一列出这类缺少列表的服务商。Tavily、文档解析器等没有模型选择的服务不需要列表。见[模型授权](./configuration.mdx#服务端托管服务商的模型授权)。
+- **渲染服务与应用一起升级。** 如果使用 MP4 视频导出，请在升级应用的同时或之前升级所有 render-service 实例：渲染任务绑定到所有者，新旧版本混用时会安全失败（拒绝请求）。
+- **检查课堂互动模型。** Pi 课堂对话会拒绝内置模型目录标明不支持工具调用的模型（`tool_calling_required`），也会拒绝 Google 的 OpenAI 兼容 Gemini 端点（`gemini_native_required`）。Gemini 请使用原生 `google` 预设，见 [LLM 提供方](./configuration.mdx#llm-提供方)。
+
+浏览器中的数据（课程、模型设置、自定义智能体）会在每个浏览器首次打开升级后的应用时导入一次。迁移模型设置见[配置](./configuration.mdx#从旧配置迁移)，完整的破坏性变更列表见 [CHANGELOG](https://github.com/THU-MAIC/OpenMAIC/blob/main/CHANGELOG.md)。
+
+## Vercel（1.1.x 及以前）
+
+Serverless 部署支持到 OpenMAIC 1.1.x，[仓库 README](https://github.com/THU-MAIC/OpenMAIC#vercel-deployment-up-to-11x) 介绍了如何在 Vercel 上部署 `release/1.1.x` 分支。这样的部署之后可以迁移到常驻主机而不丢失数据：把新主机的 `DATABASE_URL` 指向原来使用的数据库（如果用过），并沿用同一个访问地址——浏览器按站点保存数据，访客浏览器中的课程会在每个浏览器首次打开升级后的应用时导入。
+
+## 可选：MP4 视频导出
+
+“导出视频”功能会先在浏览器中生成自包含的 Hyperframes 项目，再由独立的 `render-service` 使用 Chromium 和 FFmpeg 渲染为 MP4。该服务是可选的，不影响普通课堂生成。
+
+启用 `video-export` profile：
+
+```bash
+docker compose --profile video-export up --build
+```
+
+Compose 会通过 `RENDER_SERVICE_URL` 让 OpenMAIC 连接渲染服务。未启用该 profile，或渲染服务不可用时，导出会退化为下载项目 ZIP，供本地 CLI 渲染。渲染服务使用隔离网络，启动时需要 `NET_ADMIN` capability；更多限制和独立部署方式见仓库的 [`render-service/README.md`](https://github.com/THU-MAIC/OpenMAIC/blob/main/render-service/README.md)。升级时，请在升级应用的同时或之前升级渲染服务。
+
+## 环境变量
+
+模型配置（`openmaic.yml` 和模型设置）以及全部环境变量见[配置说明](./configuration.mdx)。至少配置一个对话模型后才能生成课程。
+
+## 访问控制
+
+共享 demo 可以设置 `ACCESS_CODE`，给整站加密码门。见[配置说明 → ACCESS_CODE](./configuration.mdx#access_code--站点级访问密码)。
+
+## 可选的自托管服务
+
+- [VoxCPM2：自托管 TTS 与声音克隆 →](./voxcpm.mdx)

@@ -1,0 +1,107 @@
+---
+title: 快速開始
+description: 五分鐘內在本機跑起 OpenMAIC。
+---
+
+OpenMAIC 是一個 Next.js 應用程式，可以在自己的機器上執行。你需要至少設定一個 LLM provider：雲端 provider 通常需要 API key；本機 Ollama 或 Lemonade 不需要 API key。
+
+## 前置條件
+
+- **Node.js** 22.19.0 或更新版本
+- **pnpm** 10.28.0（如果尚未安裝，請先執行 `npm install -g pnpm@10.28.0`）
+- 至少設定一個 LLM provider；雲端 provider 通常需要 API key，本機 Ollama 或 Lemonade 不需要 API key
+
+## 安裝
+
+複製儲存庫並安裝相依套件：
+
+```bash
+git clone https://github.com/THU-MAIC/OpenMAIC.git
+cd OpenMAIC
+pnpm install
+```
+
+安裝過程中會建置專案所需的 workspace 套件，首次安裝可能需要一些時間。
+
+## 設定
+
+複製範例環境檔，填入至少一個 LLM 供應商：
+
+```bash
+cp .env.example .env.local
+```
+
+接著設定一個模型。最簡單的檔案方式是在 `.env.local` 旁邊放一個最小的 `openmaic.yml`，key 寫在 `.env.local` 中：
+
+```bash title=".env.local"
+OPENAI_API_KEY=sk-...
+```
+
+```yaml title="openmaic.yml"
+providers:
+  openai:
+    preset: openai
+    apiKey: ${OPENAI_API_KEY}
+
+slots:
+  llm: openai:gpt-5.5
+```
+
+`openmaic.example.yml` 就是這個起點，另外附有已註解的選用供應商和插槽。不使用該檔案時，舊版供應商變數仍然有效，前提是用 `DEFAULT_MODEL` 指定模型：
+
+```bash title=".env.local"
+ANTHROPIC_API_KEY=sk-ant-...
+DEFAULT_MODEL=anthropic:claude-sonnet-4-6
+```
+
+兩者都不想設定的話，啟動應用程式後在 **設定 → Token Plan** 中填入方案 key，或在 **設定 → 模型服務** 中填入某個服務的 key。既沒有 `openmaic.yml`、也沒有 `DEFAULT_MODEL`、也沒有在那裡設定服務時，沒有任何可用模型，生成會失敗。
+
+完整的 provider、圖片／影片生成、TTS、ASR、文件解析、網路搜尋、存取控制和 feature flag 設定請見[設定說明](./configuration.mdx)。
+
+## 執行
+
+課程儲存在 PostgreSQL 中，未設定 `DATABASE_URL` 時服務會拒絕啟動。先啟動本機開發資料庫（Docker 中一個獨立的 PostgreSQL，位於 `127.0.0.1:5432`，本機所有檢出共用；可用 `OPENMAIC_DB_PORT` 換連接埠），並在 `.env.local` 中設定 `DATABASE_URL`：
+
+```bash
+pnpm db:up
+```
+
+```bash title=".env.local"
+DATABASE_URL=postgres://openmaic:openmaic-dev@127.0.0.1:5432/openmaic
+```
+
+啟動開發伺服器：
+
+```bash
+pnpm dev
+```
+
+開啟 [http://localhost:3000](http://localhost:3000)，應該會看到 OpenMAIC 的課堂生成器。輸入主題或上傳學習材料，點選「生成」，AI 教師就會建立一場完整的多場景課堂。支援的材料格式取決於所選解析器，通常包括 PDF、Office 文件、Markdown／純文字、圖片及部分音訊／影片；實際範圍以解析器支援情況為準。
+
+## 匯出課堂
+
+課堂及其媒體產生完成後，點擊課堂右上角的下載按鈕開啟匯出選單：
+
+- **匯出 PPTX**：可編輯的投影片。**含佔位頁**（推薦）會把互動、測驗和專題式學習場景保留在課程中原本的位置，每個場景產生一頁帶有**線上開啟**按鈕和 QR Code 的投影片，用於在線上課堂中開啟該場景；**僅投影片**則不包含這些場景。
+- **匯出教學資源包**：同樣可選上述兩種 PPTX，另附每個互動場景的獨立網頁。
+- **匯出為 HTML**：一個無需連網即可播放整堂課的獨立檔案，包含帶字幕的旁白、聚光燈與雷射筆、投影片影片、討論卡片和互動場景；測驗、互動和專題場景會停下來，等學習者繼續。專題式學習場景只保留專題簡介（目標和里程碑），繼續完成專題需要連網回到線上課堂。如果匯出時提示有資源無法打包，互動場景中的這些部分不會在離線 HTML 中顯示，但在線上課堂中仍可正常使用。**包含旁白和影片**的播放效果與課堂一致；**不含旁白**的檔案較小，字幕依閱讀時間推進，不包含影片。
+- **匯出課堂 ZIP**：課程結構和媒體檔案，用於備份，或匯入到另一個 OpenMAIC 部署。
+
+如果匯出的單一 HTML 檔案會超過 400 MB，課堂會改為匯出 ZIP：先完整解壓縮，再開啟 `classroom.html`，並讓 `audio/`、`media/` 和 `images/` 資料夾與它保持在同一目錄。
+
+匯出的 HTML 檔案需要在啟用 JavaScript 的瀏覽器中開啟。在手機上請用 Safari、Chrome 等瀏覽器開啟：在 iPhone 上，它無法在微信內或「檔案」的預覽中播放。
+
+## 生產建置
+
+```bash
+pnpm build
+DATABASE_URL=postgres://... pnpm start
+```
+
+也可以用 Docker 部署，或部署到你自己的伺服器上——請見[部署指南](./deployment.mdx)。
+
+## 下一步
+
+- [設定 provider、TTS、ACCESS_CODE →](./configuration.mdx)
+- [用 Docker 或在自己的伺服器上部署 →](./deployment.mdx)
+- 想了解架構或貢獻程式碼，請前往 [GitHub](https://github.com/THU-MAIC/OpenMAIC#-contributing)

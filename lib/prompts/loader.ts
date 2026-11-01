@@ -4,6 +4,7 @@
  * Supports:
  * - Loading prompts from templates/{promptId}/ directory
  * - Snippet inclusion via {{snippet:name}} syntax
+ * - Conditional blocks via {{#if condition}}...{{/if}} syntax
  * - Variable interpolation via {{variable}} syntax
  */
 
@@ -11,6 +12,10 @@ import fs from 'fs';
 import path from 'path';
 import type { PromptId, LoadedPrompt, SnippetId } from './types';
 import { createLogger } from '@/lib/logger';
+import {
+  loadSnippet as loadGenerationSnippet,
+  type SnippetId as GenerationSnippetId,
+} from '@openmaic/generation';
 const log = createLogger('PromptLoader');
 
 /**
@@ -30,20 +35,40 @@ export function loadSnippet(snippetId: SnippetId): string {
   try {
     return fs.readFileSync(snippetPath, 'utf-8').trim();
   } catch {
-    // Fail loud rather than silently shipping `{{snippet:foo}}` to the LLM.
-    // A missing snippet is always a config/typo bug — surface at load time.
-    throw new Error(`Snippet not found: ${snippetId}`);
+    // App-only templates can reuse package-owned generation snippets without
+    // retaining a second on-disk copy.
+    return loadGenerationSnippet(snippetId as GenerationSnippetId);
   }
 }
 
 /**
- * Process snippet includes in a template
- * Replaces {{snippet:name}} with actual snippet content
+ * Process snippet includes in a template.
+ * Replaces {{snippet:name}} with actual snippet content.
  */
-function processSnippets(template: string): string {
+export function processSnippets(template: string): string {
   return template.replace(/\{\{snippet:(\w[\w-]*)\}\}/g, (_, snippetId) => {
     return loadSnippet(snippetId as SnippetId);
   });
+}
+
+/**
+ * Process conditional blocks in a template.
+ * Replaces {{#if conditionName}}...{{/if}} with the inner content when the
+ * named condition is truthy, or removes the entire block when it is falsy.
+ *
+ * Blocks do not nest — this is intentional to keep the prompt templating
+ * language simple and reviewable.
+ */
+export function processConditionalBlocks(
+  template: string,
+  conditions: Record<string, unknown>,
+): string {
+  return template.replace(
+    /\{\{#if (\w+)\}\}([\s\S]*?)\{\{\/if\}\}/g,
+    (_, conditionName: string, content: string) => {
+      return conditions[conditionName] ? content : '';
+    },
+  );
 }
 
 /**
@@ -96,8 +121,20 @@ export function interpolateVariables(template: string, variables: Record<string,
   });
 }
 
+function applyPromptVariableDefaults(
+  _promptId: PromptId,
+  variables: Record<string, unknown>,
+): Record<string, unknown> {
+  return variables;
+}
+
 /**
- * Build a complete prompt with variables
+ * Build a complete prompt with variables.
+ *
+ * Processing order:
+ *   1. Snippet includes ({{snippet:name}}) — file content spliced in
+ *   2. Conditional blocks ({{#if flag}}...{{/if}}) — gated on `variables`
+ *   3. Variable interpolation ({{varName}}) — values substituted
  */
 export function buildPrompt(
   promptId: PromptId,
@@ -105,9 +142,16 @@ export function buildPrompt(
 ): { system: string; user: string } | null {
   const prompt = loadPrompt(promptId);
   if (!prompt) return null;
+  const resolvedVariables = applyPromptVariableDefaults(promptId, variables);
 
   return {
-    system: interpolateVariables(prompt.systemPrompt, variables),
-    user: interpolateVariables(prompt.userPromptTemplate, variables),
+    system: interpolateVariables(
+      processConditionalBlocks(prompt.systemPrompt, resolvedVariables),
+      resolvedVariables,
+    ),
+    user: interpolateVariables(
+      processConditionalBlocks(prompt.userPromptTemplate, resolvedVariables),
+      resolvedVariables,
+    ),
   };
 }

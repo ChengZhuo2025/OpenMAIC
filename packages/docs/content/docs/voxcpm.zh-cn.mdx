@@ -1,0 +1,86 @@
+---
+title: VoxCPM2
+description: 自托管 TTS 与声音克隆。后端选型、配置和声音管理。
+---
+
+[VoxCPM2](https://github.com/OpenBMB/VoxCPM) 是 OpenBMB 开源的 TTS 模型，支持声音克隆。OpenMAIC 自带适配器，把 VoxCPM 跑在自己机器上即可对接。
+
+## 什么时候用 VoxCPM2
+
+- 想要稳定、免费的 TTS，无字符计费。
+- 想要声音克隆（每个 Agent 用一段短样本生成自己的音色）。
+- 在本地部署或离线环境。
+
+如果只想要一个默认音色，用内置的 **豆包** 或 **OpenAI 兼容** 提供方更简单，参见 [配置 → TTS 提供方](./configuration.mdx#tts-提供方)。
+
+## 1. 起一个 VoxCPM 后端
+
+OpenMAIC 支持三种部署形态，三种走的是同一个 OpenMAIC 适配器；在 `openmaic.yml` 中通过服务商的 `options.backend` 选择你运行的那一种（见第 2 步）。
+
+| 后端           | 端点               | 适用场景                                     |
+| -------------- | ------------------ | -------------------------------------------- |
+| **vLLM-Omni**  | `/v1/audio/speech` | OpenAI 兼容的语音端点，适合 GPU 服务器。     |
+| **Python API** | `/tts/upload`      | VoxCPM 官方 Python runtime（基于 FastAPI）。 |
+| **Nano-vLLM**  | `/generate`        | 轻量的 Nano-vLLM FastAPI 部署，适合小机器。  |
+
+每种后端的具体启动方式见 [VoxCPM 仓库](https://github.com/OpenBMB/VoxCPM)。一个典型的本地快速启动：
+
+```bash
+# vLLM-Omni 示例
+pip install vllm
+python -m vllm_omni.server --model openbmb/VoxCPM2 --port 8000
+# 端点为 http://localhost:8000/v1
+```
+
+## 2. 让 OpenMAIC 对接它
+
+VoxCPM2 运行在你自己的网络中，因此它的端点由部署配置，工作区不能在 **设置 → 模型服务** 中添加它。请在 `openmaic.yml` 中声明它，用 `options.backend` 选择后端，并分配给 `tts` 槽位，不需要 API key：
+
+```yaml title="openmaic.yml"
+providers:
+  voxcpm:
+    preset: voxcpm-tts
+    baseUrl: http://localhost:8000/v1
+    options:
+      backend: vllm-omni          # vllm-omni（默认）| python-api | nano-vllm
+
+slots:
+  tts: voxcpm
+```
+
+服务商的 `options.backend` 作用于 `tts` 槽位上的所有请求。音色注册只在 `vllm-omni` 后端可用；使用 `python-api` 和 `nano-vllm` 时，音色提示会随每次请求发送。
+
+没有 `openmaic.yml` 时，旧版变量可以配置端点，但无法选择后端；如需 `python-api` 或 `nano-vllm`，请使用 `openmaic.yml`：
+
+```bash
+TTS_VOXCPM_BASE_URL=http://localhost:8000/v1
+```
+
+由于该服务商由服务端托管，它的端点可以位于内网而无需 `ALLOW_LOCAL_NETWORKS`，用户也无法覆盖它。
+
+## 3. 声音管理
+
+先把 VoxCPM2 分配给 `tts` 槽位（第 2 步），再打开 **设置 → 模型服务 → 语音合成 → VoxCPM2**。只有当 `tts` 槽位解析到 `voxcpm-tts` 服务商时才会出现 VoxCPM 音色管理，其中有三种音色模式。
+
+### Auto Voice（默认）
+
+OpenMAIC 在合成时根据每个 Agent 的人设动态生成 voice prompt。无需任何配置，什么都不做就是这个效果。
+
+### Prompt voice（提示词音色）
+
+用自然语言描述音色。生成后可以复用，分配给任意 Agent。
+
+> _示例："温暖的女老师声音，平稳鼓励，中音域，吐字清晰。"_
+
+### Clone voice（声音克隆）
+
+上传一段短的参考音频（≤ 60 秒，≤ 10 MB），或者直接在浏览器里录一段。音频存在 IndexedDB 中，每次合成时发给后端。
+
+## 常见问题
+
+| 现象                     | 可能原因                                                        |
+| ------------------------ | --------------------------------------------------------------- |
+| 请求返回 404 | `options.backend` 与你运行的后端不一致，对照第 1 步的端点表。 |
+| 第一次克隆请求要等 ~30s  | 后端冷启动，后续克隆会复用热运行时。                            |
+| 音频说到一半就断         | 后端输出 token 数受限，提高 `--max-tokens` 或对应 VoxCPM 配置。 |
+| 401 / 403                | 给一个不需要 key 的后端配了 `TTS_VOXCPM_API_KEY`，留空即可。    |

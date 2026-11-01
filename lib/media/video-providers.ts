@@ -9,14 +9,27 @@ import type {
   VideoGenerationResult,
   VideoProviderConfig,
 } from './types';
-import { generateWithSeedance, testSeedanceConnectivity } from './adapters/seedance-adapter';
+import type { PolledTaskControl } from './polled-task';
+import {
+  generateWithSeedance,
+  seedanceApiRoot,
+  testSeedanceConnectivity,
+} from './adapters/seedance-adapter';
 import { generateWithKling, testKlingConnectivity } from './adapters/kling-adapter';
-import { generateWithVeo, testVeoConnectivity } from './adapters/veo-adapter';
 import {
   generateWithMiniMaxVideo,
   testMiniMaxVideoConnectivity,
 } from './adapters/minimax-video-adapter';
 import { generateWithGrokVideo, testGrokVideoConnectivity } from './adapters/grok-video-adapter';
+import { generateWithHappyHorse, testHappyHorseConnectivity } from './adapters/happyhorse-adapter';
+import {
+  generateWithOpenRouterVideo,
+  testOpenRouterVideoConnectivity,
+} from './adapters/openrouter-video-adapter';
+import {
+  OPENROUTER_DEFAULT_BASE_URL,
+  openRouterBaseUrl,
+} from './adapters/openrouter-image-adapter';
 
 export const VIDEO_PROVIDERS: Record<VideoProviderId, VideoProviderConfig> = {
   seedance: {
@@ -25,7 +38,15 @@ export const VIDEO_PROVIDERS: Record<VideoProviderId, VideoProviderConfig> = {
     requiresApiKey: true,
     defaultBaseUrl: 'https://ark.cn-beijing.volces.com',
     models: [
-      { id: 'doubao-seedance-1-5-pro-251215', name: 'Seedance 1.5 Pro' },
+      { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
+      {
+        id: 'doubao-seedance-2-0-fast-260128',
+        name: 'Seedance 2.0 Fast',
+      },
+      {
+        id: 'doubao-seedance-2-0-mini-260615',
+        name: 'Seedance 2.0 Mini',
+      },
       { id: 'doubao-seedance-1-0-pro-250528', name: 'Seedance 1.0 Pro' },
       {
         id: 'doubao-seedance-1-0-pro-fast-251015',
@@ -54,39 +75,15 @@ export const VIDEO_PROVIDERS: Record<VideoProviderId, VideoProviderConfig> = {
     supportedDurations: [5, 10],
     maxDuration: 10,
   },
-  veo: {
-    id: 'veo',
-    name: 'Veo',
-    requiresApiKey: true,
-    defaultBaseUrl: 'https://generativelanguage.googleapis.com',
-    models: [
-      { id: 'veo-3.1-fast-generate-001', name: 'Veo 3.1 Fast' },
-      { id: 'veo-3.1-generate-001', name: 'Veo 3.1' },
-      { id: 'veo-3.0-fast-generate-001', name: 'Veo 3.0 Fast' },
-      { id: 'veo-3.0-generate-001', name: 'Veo 3.0' },
-      { id: 'veo-2.0-generate-001', name: 'Veo 2.0' },
-    ],
-    supportedAspectRatios: ['16:9', '1:1', '9:16'],
-    supportedDurations: [8],
-    supportedResolutions: ['720p'],
-    maxDuration: 8,
-  },
-  sora: {
-    id: 'sora',
-    name: 'Sora',
-    requiresApiKey: true,
-    models: [],
-    supportedAspectRatios: ['16:9', '1:1', '9:16'],
-    maxDuration: 20,
-  },
   'minimax-video': {
     id: 'minimax-video',
     name: 'MiniMax Video',
     requiresApiKey: true,
     defaultBaseUrl: 'https://api.minimaxi.com',
+    // Hailuo 2.3 Fast requires Image-to-Video with first_frame_image; this
+    // provider currently submits Text-to-Video requests only.
     models: [
       { id: 'MiniMax-Hailuo-2.3', name: 'Hailuo 2.3' },
-      { id: 'MiniMax-Hailuo-2.3-Fast', name: 'Hailuo 2.3 Fast' },
       { id: 'MiniMax-Hailuo-02', name: 'Hailuo 02' },
       { id: 'T2V-01-Director', name: 'T2V-01 Director' },
       { id: 'T2V-01', name: 'T2V-01' },
@@ -106,6 +103,34 @@ export const VIDEO_PROVIDERS: Record<VideoProviderId, VideoProviderConfig> = {
     supportedDurations: [6],
     maxDuration: 6,
   },
+  happyhorse: {
+    id: 'happyhorse',
+    name: 'HappyHorse',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://dashscope.aliyuncs.com',
+    models: [{ id: 'happyhorse-1.0-t2v', name: 'HappyHorse 1.0 T2V' }],
+    supportedAspectRatios: ['16:9', '9:16', '1:1', '4:3', '3:4'],
+    supportedDurations: [5, 10, 15],
+    supportedResolutions: ['720p', '1080p'],
+    maxDuration: 15,
+  },
+  'openrouter-video': {
+    id: 'openrouter-video',
+    name: 'OpenRouter Video',
+    requiresApiKey: true,
+    defaultBaseUrl: OPENROUTER_DEFAULT_BASE_URL,
+    // Model list is fetched live from OpenRouter's public GET /videos/models
+    // catalog; this seed keeps the picker usable offline.
+    models: [
+      { id: 'google/veo-3.1', name: 'Veo 3.1' },
+      { id: 'kwaivgi/kling-v3.0-pro', name: 'Kling v3.0 Pro' },
+      { id: 'bytedance/seedance-2.5', name: 'Seedance 2.5' },
+    ],
+    supportedAspectRatios: ['16:9', '9:16', '1:1', '4:3', '3:4', '21:9'],
+    supportedDurations: [4, 5, 6, 8, 10],
+    supportedResolutions: ['480p', '720p', '1080p'],
+    maxDuration: 10,
+  },
 };
 
 export async function testVideoConnectivity(
@@ -116,12 +141,14 @@ export async function testVideoConnectivity(
       return testSeedanceConnectivity(config);
     case 'kling':
       return testKlingConnectivity(config);
-    case 'veo':
-      return testVeoConnectivity(config);
     case 'minimax-video':
       return testMiniMaxVideoConnectivity(config);
     case 'grok-video':
       return testGrokVideoConnectivity(config);
+    case 'happyhorse':
+      return testHappyHorseConnectivity(config);
+    case 'openrouter-video':
+      return testOpenRouterVideoConnectivity(config);
     default:
       return {
         success: false,
@@ -172,21 +199,45 @@ export function normalizeVideoOptions(
   return normalized;
 }
 
+/**
+ * The endpoint a provider's video tasks live on, as its adapter reaches it
+ * from a configured base URL: the provider's default when none is set, with
+ * the adapter's own normalization and without trailing slashes. Two base
+ * URLs with the same endpoint reach the same tasks.
+ */
+export function videoTaskEndpoint(providerId: VideoProviderId, baseUrl?: string): string {
+  const root =
+    providerId === 'seedance'
+      ? seedanceApiRoot(baseUrl)
+      : providerId === 'openrouter-video'
+        ? openRouterBaseUrl(baseUrl)
+        : baseUrl || VIDEO_PROVIDERS[providerId]?.defaultBaseUrl || '';
+  return root.replace(/\/+$/, '');
+}
+
+/**
+ * Generate a video: submit the provider task and wait for it. `control`
+ * learns the provider's task id before the wait, or resumes the wait on a
+ * task submitted earlier.
+ */
 export async function generateVideo(
   config: VideoGenerationConfig,
   options: VideoGenerationOptions,
+  control?: PolledTaskControl,
 ): Promise<VideoGenerationResult> {
   switch (config.providerId) {
     case 'seedance':
-      return generateWithSeedance(config, options);
+      return generateWithSeedance(config, options, control);
     case 'kling':
-      return generateWithKling(config, options);
-    case 'veo':
-      return generateWithVeo(config, options);
+      return generateWithKling(config, options, control);
     case 'minimax-video':
-      return generateWithMiniMaxVideo(config, options);
+      return generateWithMiniMaxVideo(config, options, control);
     case 'grok-video':
-      return generateWithGrokVideo(config, options);
+      return generateWithGrokVideo(config, options, control);
+    case 'happyhorse':
+      return generateWithHappyHorse(config, options, control);
+    case 'openrouter-video':
+      return generateWithOpenRouterVideo(config, options, control);
     default:
       throw new Error(`Unsupported video provider: ${config.providerId}`);
   }

@@ -1,121 +1,216 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog';
 import { useI18n } from '@/lib/hooks/use-i18n';
 import { useSettingsStore } from '@/lib/store/settings';
-import { TTS_PROVIDERS, DEFAULT_TTS_VOICES } from '@/lib/audio/constants';
-import type { TTSProviderId } from '@/lib/audio/types';
-import { Volume2, Loader2, CheckCircle2, XCircle, Eye, EyeOff, Plus } from 'lucide-react';
+import {
+  TTS_PROVIDERS,
+  isQwenCloneVoice,
+  getManuallySelectableTTSModels,
+} from '@/lib/audio/constants';
+import type { BuiltInTTSProviderId } from '@/lib/audio/types';
+import { Volume2, Loader2, CheckCircle2, XCircle, Eye, EyeOff } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { toast } from 'sonner';
 import { createLogger } from '@/lib/logger';
 import { useTTSPreview } from '@/lib/audio/use-tts-preview';
-import { isCustomTTSProvider } from '@/lib/audio/types';
+import { getVoxCPMProviderOptions } from '@/lib/audio/voxcpm-voices';
+import { VOXCPM_TTS_PROVIDER_ID } from '@/lib/audio/voxcpm';
+import { defaultVoiceFor, slotVoxCPMBackend, ttsSelection } from '@/lib/audio/tts-selection';
+import { modelCapabilities } from '@/lib/model-settings/capabilities';
+import { assignService } from '@/lib/model-settings/services';
+import { regionalEndpointTemplate } from '@/lib/config/official-endpoints';
+import { QwenVoiceCloneManager, VoxCPMVoiceManager } from './tts-voice-managers';
+import { TTSSpeedField } from './tts-speed-field';
+import {
+  ApiKeyField,
+  CredentialStorageHint,
+  EndpointServerOnlyHint,
+  RegionalEndpointField,
+  ServerConfiguredNotice,
+  ServerOnlyNotice,
+  reportApply,
+  rootUse,
+  saveServiceProvider,
+  type ServicePanelProps,
+} from './server-settings';
 
 const log = createLogger('TTSSettings');
 
-interface TTSSettingsProps {
-  selectedProviderId: TTSProviderId;
+/**
+ * Doubao's key is an app id and an access key, stored as one key
+ * (`appId:accessKey`): two fields, saved together once both are filled.
+ */
+function DoubaoKeyFields({ onSave }: { onSave: (key: string) => Promise<unknown> }) {
+  const { t } = useI18n();
+  const [appId, setAppId] = useState('');
+  const [accessKey, setAccessKey] = useState('');
+  const [show, setShow] = useState(false);
+  const commit = async () => {
+    if (!appId.trim() || !accessKey.trim()) return;
+    // Cleared only once the server took the key.
+    if (!(await onSave(`${appId.trim()}:${accessKey.trim()}`))) return;
+    setAppId('');
+    setAccessKey('');
+  };
+  const field = (label: string, value: string, set: (value: string) => void, name: string) => (
+    <div className="space-y-2">
+      <Label className="text-sm">{label}</Label>
+      <div className="relative">
+        <Input
+          name={name}
+          aria-label={name}
+          type={show ? 'text' : 'password'}
+          autoComplete="new-password"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder={t('settings.enterApiKey')}
+          value={value}
+          onChange={(e) => set(e.target.value)}
+          onBlur={() => void commit()}
+          className="font-mono text-sm pr-10"
+        />
+        <button
+          type="button"
+          onClick={() => setShow(!show)}
+          className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+        >
+          {show ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+        </button>
+      </div>
+    </div>
+  );
+  return (
+    <>
+      {field(t('settings.doubaoAppId'), appId, setAppId, 'tts-app-id-doubao-tts')}
+      {field(t('settings.doubaoAccessKey'), accessKey, setAccessKey, 'tts-access-key-doubao-tts')}
+    </>
+  );
 }
 
-export function TTSSettings({ selectedProviderId }: TTSSettingsProps) {
-  const { t } = useI18n();
+/**
+ * A text-to-speech service: its key (write-only), the user's narration speed,
+ * a spoken test on the server with the saved configuration, its models, and
+ * the voices a user makes for voice-design providers.
+ */
+/** Path each built-in TTS service calls under its base URL, for the request URL hint. */
+export function ttsEndpointPath(providerId: string): string {
+  switch (providerId) {
+    case 'openai-tts':
+    case 'glm-tts':
+    case 'lemonade-tts':
+      return '/audio/speech';
+    case 'azure-tts':
+      return '/cognitiveservices/v1';
+    case 'qwen-tts':
+      return '/services/aigc/multimodal-generation/generation';
+    case 'elevenlabs-tts':
+      return '/text-to-speech';
+    case 'doubao-tts':
+      return '/unidirectional';
+    case 'google-tts':
+      return '/interactions';
+    default:
+      return '';
+  }
+}
 
-  const ttsVoice = useSettingsStore((state) => state.ttsVoice);
+export function TTSSettings({ view, apply, entry }: ServicePanelProps) {
+  const { t, locale } = useI18n();
+
   const ttsSpeed = useSettingsStore((state) => state.ttsSpeed);
-  const ttsProvidersConfig = useSettingsStore((state) => state.ttsProvidersConfig);
-  const setTTSProviderConfig = useSettingsStore((state) => state.setTTSProviderConfig);
-  const activeProviderId = useSettingsStore((state) => state.ttsProviderId);
-  const setTTSVoice = useSettingsStore((state) => state.setTTSVoice);
-  const removeCustomTTSProvider = useSettingsStore((state) => state.removeCustomTTSProvider);
+  const setTTSSpeed = useSettingsStore((state) => state.setTTSSpeed);
+  const ttsVoice = useSettingsStore((state) => state.ttsVoice);
+  const ttsVoiceProviderId = useSettingsStore((state) => state.ttsVoiceProviderId);
 
-  const ttsProvider = TTS_PROVIDERS[selectedProviderId as keyof typeof TTS_PROVIDERS];
-  const isCustom = isCustomTTSProvider(selectedProviderId);
-  const providerConfig = ttsProvidersConfig[selectedProviderId];
-  const isServerConfigured = !!providerConfig?.isServerConfigured;
-  const requiresApiKey = isCustom
-    ? !!providerConfig?.requiresApiKey
-    : !!ttsProvider?.requiresApiKey;
+  const providerId = entry.registryId;
+  const ttsProvider = TTS_PROVIDERS[providerId as BuiltInTTSProviderId];
+  const isBrowser = providerId === 'browser-native-tts';
+  const isVoxCPM = providerId === VOXCPM_TTS_PROVIDER_ID;
+  const isDoubao = providerId === 'doubao-tts';
+  const editable =
+    (entry.state === 'workspace' || entry.state === 'available') &&
+    !isBrowser &&
+    !!ttsProvider?.requiresApiKey;
+  const use = rootUse(view, 'tts', entry.id);
+  const manuallySelectableModels = getManuallySelectableTTSModels(
+    providerId as BuiltInTTSProviderId,
+  );
 
-  // When testing a non-active provider, use that provider's default voice
-  // instead of the active provider's voice (which may be incompatible).
+  // The voice the test speaks with: the user's while this service is the
+  // workspace's narration, else the service's own default.
+  const capabilities = useMemo(() => modelCapabilities(view), [view]);
+  const selection = useMemo(
+    () =>
+      ttsSelection(capabilities, {
+        voice: ttsVoice,
+        providerId: ttsVoiceProviderId,
+        speed: ttsSpeed,
+      }),
+    [capabilities, ttsVoice, ttsVoiceProviderId, ttsSpeed],
+  );
   const effectiveVoice =
-    selectedProviderId === activeProviderId
-      ? ttsVoice
-      : isCustomTTSProvider(selectedProviderId)
-        ? ((providerConfig?.customVoices as Array<{ id: string }> | undefined) || [])[0]?.id ||
-          'default'
-        : DEFAULT_TTS_VOICES[selectedProviderId as keyof typeof DEFAULT_TTS_VOICES] || 'default';
+    use.inUse && selection
+      ? selection.voice
+      : defaultVoiceFor(providerId, use.modelId, entry.provider?.options, entry.provider?.voices);
+  const cloneSpeedDisabled =
+    providerId === 'qwen-tts' && isQwenCloneVoice(effectiveVoice, entry.provider?.voices);
+  const configured = entry.state === 'deployment' || entry.state === 'workspace' || isBrowser;
+  // A service that needs no key (the browser's own speech) can be made the
+  // workspace's narration here: it is added first when it is not saved yet.
+  const keyless = !ttsProvider?.requiresApiKey && entry.state !== 'server-only';
+  const [assigning, setAssigning] = useState(false);
+  const makeNarration = async () => {
+    setAssigning(true);
+    try {
+      reportApply(await assignService(apply, view, entry, 'tts'), t);
+    } finally {
+      setAssigning(false);
+    }
+  };
 
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [testText, setTestText] = useState(t('settings.ttsTestTextDefault'));
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [testMessage, setTestMessage] = useState('');
   const { previewing: testingTTS, startPreview, stopPreview } = useTTSPreview();
-
-  // Doubao TTS uses compound "appId:accessKey" — split for separate UI fields
-  const isDoubao = selectedProviderId === 'doubao-tts';
-  const rawApiKey = ttsProvidersConfig[selectedProviderId]?.apiKey || '';
-  const doubaoColonIdx = rawApiKey.indexOf(':');
-  const doubaoAppId = isDoubao && doubaoColonIdx > 0 ? rawApiKey.slice(0, doubaoColonIdx) : '';
-  const doubaoAccessKey =
-    isDoubao && doubaoColonIdx > 0
-      ? rawApiKey.slice(doubaoColonIdx + 1)
-      : isDoubao
-        ? rawApiKey
-        : '';
-
-  const setDoubaoCompoundKey = (appId: string, accessKey: string) => {
-    const combined = appId && accessKey ? `${appId}:${accessKey}` : appId || accessKey;
-    setTTSProviderConfig(selectedProviderId, { apiKey: combined });
-  };
 
   // Keep the sample text in sync with locale changes.
   useEffect(() => {
     setTestText(t('settings.ttsTestTextDefault'));
   }, [t]);
 
-  // Reset transient UI state when switching providers.
-  useEffect(() => {
-    stopPreview();
-    setShowApiKey(false);
-    setTestStatus('idle');
-    setTestMessage('');
-  }, [selectedProviderId, stopPreview]);
+  // Stop a preview when the panel goes away.
+  useEffect(() => stopPreview, [stopPreview]);
+
+  const save = (apiKey: string) => saveServiceProvider(view, apply, entry, { apiKey }, t);
+  // Azure Speech takes its official endpoint for the region the key belongs to.
+  const regionalEndpoint = regionalEndpointTemplate('tts', providerId);
 
   const handleTestTTS = async () => {
     if (!testText.trim()) return;
-
     setTestStatus('testing');
     setTestMessage('');
-
     try {
+      const providerOptions = isVoxCPM
+        ? await getVoxCPMProviderOptions(effectiveVoice, {
+            role: 'teacher',
+            locale,
+            backend: slotVoxCPMBackend(capabilities.tts),
+          })
+        : undefined;
       await startPreview({
         text: testText,
-        providerId: selectedProviderId,
-        modelId:
-          ttsProvidersConfig[selectedProviderId]?.modelId || ttsProvider?.defaultModelId || '',
+        providerId,
         voice: effectiveVoice,
         speed: ttsSpeed,
-        apiKey: ttsProvidersConfig[selectedProviderId]?.apiKey,
-        baseUrl:
-          ttsProvidersConfig[selectedProviderId]?.baseUrl ||
-          providerConfig?.customDefaultBaseUrl ||
-          '',
+        providerOptions,
+        // The service as the server saved it, not necessarily the one in use.
+        ...(isBrowser
+          ? {}
+          : { previewProvider: entry.id, ...(use.modelId ? { previewModel: use.modelId } : {}) }),
       });
       setTestStatus('success');
       setTestMessage(t('settings.ttsTestSuccess'));
@@ -131,205 +226,120 @@ export function TTSSettings({ selectedProviderId }: TTSSettingsProps) {
   };
 
   return (
-    <div className="space-y-6 max-w-3xl">
-      {/* Server-configured notice */}
-      {isServerConfigured && (
-        <div className="rounded-lg border border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950/30 p-3 text-sm text-blue-700 dark:text-blue-300">
-          {t('settings.serverConfiguredNotice')}
+    <div className={cn('space-y-6', isVoxCPM ? 'max-w-5xl' : 'max-w-3xl')}>
+      {/* Browser-native TTS can't produce managed audio files, so the Pro-mode
+          timeline's per-line audio (preview / regenerate / bulk voiceover) is
+          unavailable on it — surface that when this provider is selected. */}
+      {isBrowser && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-700 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+          {t('settings.ttsBrowserNativeTimelineNotice')}
         </div>
       )}
 
-      {/* API Key & Base URL */}
-      {(requiresApiKey || isServerConfigured || isCustom) && (
+      {entry.state === 'deployment' && <ServerConfiguredNotice view={view} capability="tts" />}
+      {entry.state === 'server-only' && <ServerOnlyNotice noUserKeys={!view.allowUserKeys} />}
+
+      {/* API Key & Base URL — the server's services are the operator's. */}
+      {editable && (
         <>
           <div className={cn('grid gap-4', isDoubao ? 'grid-cols-3' : 'grid-cols-2')}>
             {isDoubao ? (
-              <>
-                <div className="space-y-2">
-                  <Label className="text-sm">{t('settings.doubaoAppId')}</Label>
-                  <div className="relative">
-                    <Input
-                      name={`tts-app-id-${selectedProviderId}`}
-                      type={showApiKey ? 'text' : 'password'}
-                      autoComplete="new-password"
-                      autoCapitalize="none"
-                      autoCorrect="off"
-                      spellCheck={false}
-                      placeholder={
-                        isServerConfigured
-                          ? t('settings.optionalOverride')
-                          : t('settings.enterApiKey')
-                      }
-                      value={doubaoAppId}
-                      onChange={(e) => setDoubaoCompoundKey(e.target.value, doubaoAccessKey)}
-                      className="font-mono text-sm pr-10"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowApiKey(!showApiKey)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    >
-                      {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                    </button>
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-sm">{t('settings.doubaoAccessKey')}</Label>
-                  <div className="relative">
-                    <Input
-                      name={`tts-access-key-${selectedProviderId}`}
-                      type={showApiKey ? 'text' : 'password'}
-                      autoComplete="new-password"
-                      autoCapitalize="none"
-                      autoCorrect="off"
-                      spellCheck={false}
-                      placeholder={
-                        isServerConfigured
-                          ? t('settings.optionalOverride')
-                          : t('settings.enterApiKey')
-                      }
-                      value={doubaoAccessKey}
-                      onChange={(e) => setDoubaoCompoundKey(doubaoAppId, e.target.value)}
-                      className="font-mono text-sm pr-10"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowApiKey(!showApiKey)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                    >
-                      {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                    </button>
-                  </div>
-                </div>
-              </>
+              <DoubaoKeyFields onSave={save} />
             ) : (
               <div className="space-y-2">
                 <Label className="text-sm">{t('settings.ttsApiKey')}</Label>
-                <div className="relative">
-                  <Input
-                    name={`tts-api-key-${selectedProviderId}`}
-                    type={showApiKey ? 'text' : 'password'}
-                    autoComplete="new-password"
-                    autoCapitalize="none"
-                    autoCorrect="off"
-                    spellCheck={false}
-                    placeholder={
-                      isServerConfigured
-                        ? t('settings.optionalOverride')
-                        : t('settings.enterApiKey')
-                    }
-                    value={ttsProvidersConfig[selectedProviderId]?.apiKey || ''}
-                    onChange={(e) =>
-                      setTTSProviderConfig(selectedProviderId, {
-                        apiKey: e.target.value,
-                      })
-                    }
-                    className="font-mono text-sm pr-10"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-                  >
-                    {showApiKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
-                </div>
+                <ApiKeyField
+                  name={`tts-api-key-${entry.id}`}
+                  provider={entry.provider}
+                  inputClassName="font-mono text-sm"
+                  onSave={save}
+                  onRemove={() => save('')}
+                />
               </div>
             )}
             <div className="space-y-2">
               <Label className="text-sm">{t('settings.ttsBaseUrl')}</Label>
-              <Input
-                name={`tts-base-url-${selectedProviderId}`}
-                autoComplete="off"
-                autoCapitalize="none"
-                autoCorrect="off"
-                spellCheck={false}
-                placeholder={
-                  isCustom
-                    ? providerConfig?.customDefaultBaseUrl || 'http://localhost:8000/v1'
-                    : ttsProvider?.defaultBaseUrl || t('settings.enterCustomBaseUrl')
-                }
-                value={ttsProvidersConfig[selectedProviderId]?.baseUrl || ''}
-                onChange={(e) =>
-                  setTTSProviderConfig(selectedProviderId, {
-                    baseUrl: e.target.value,
-                  })
-                }
-                className="text-sm"
-              />
+              {regionalEndpoint ? (
+                <RegionalEndpointField
+                  name={`tts-endpoint-${entry.id}`}
+                  provider={entry.provider}
+                  template={regionalEndpoint}
+                  onSave={(baseUrl) => saveServiceProvider(view, apply, entry, { baseUrl }, t)}
+                />
+              ) : (
+                <>
+                  {ttsProvider?.defaultBaseUrl && (
+                    <p className="text-xs text-muted-foreground break-all">
+                      {t('settings.requestUrl')}: {ttsProvider.defaultBaseUrl}
+                      {ttsEndpointPath(providerId)}
+                    </p>
+                  )}
+                  <EndpointServerOnlyHint />
+                </>
+              )}
             </div>
           </div>
-          {/* Request URL Preview */}
-          {(() => {
-            const effectiveBaseUrl =
-              ttsProvidersConfig[selectedProviderId]?.baseUrl ||
-              (isCustom ? providerConfig?.customDefaultBaseUrl : ttsProvider?.defaultBaseUrl) ||
-              '';
-            if (!effectiveBaseUrl) return null;
-            let endpointPath = '';
-            if (isCustom) {
-              endpointPath = '/audio/speech';
-            } else {
-              switch (selectedProviderId) {
-                case 'openai-tts':
-                case 'glm-tts':
-                  endpointPath = '/audio/speech';
-                  break;
-                case 'azure-tts':
-                  endpointPath = '/cognitiveservices/v1';
-                  break;
-                case 'qwen-tts':
-                  endpointPath = '/services/aigc/multimodal-generation/generation';
-                  break;
-                case 'elevenlabs-tts':
-                  endpointPath = '/text-to-speech';
-                  break;
-                case 'doubao-tts':
-                  endpointPath = '/unidirectional';
-                  break;
-              }
-            }
-            if (!endpointPath) return null;
-            return (
-              <p className="text-xs text-muted-foreground break-all">
-                {t('settings.requestUrl')}: {effectiveBaseUrl + endpointPath}
-              </p>
-            );
-          })()}
+          {isDoubao && <CredentialStorageHint />}
+          {isDoubao && entry.provider?.key?.set && (
+            <p className="text-xs text-muted-foreground">
+              {t('settings.serverConfig.keyStored', { mask: entry.provider.key.mask ?? '' })}
+            </p>
+          )}
         </>
       )}
 
-      {/* Test TTS */}
-      <div className="space-y-2">
-        <Label className="text-sm">{t('settings.testTTS')}</Label>
-        <div className="flex gap-2">
-          <Input
-            placeholder={t('settings.ttsTestTextPlaceholder')}
-            value={testText}
-            onChange={(e) => setTestText(e.target.value)}
-            className="flex-1"
+      {entry.state !== 'server-only' && (
+        <>
+          <TTSSpeedField
+            provider={ttsProvider}
+            speed={ttsSpeed}
+            cloneVoiceLocked={cloneSpeedDisabled}
+            onSpeedChange={setTTSSpeed}
           />
-          <Button
-            onClick={handleTestTTS}
-            disabled={
-              testingTTS ||
-              !testText.trim() ||
-              (requiresApiKey &&
-                !ttsProvidersConfig[selectedProviderId]?.apiKey?.trim() &&
-                !isServerConfigured)
-            }
-            size="default"
-            className="gap-2 w-32"
-          >
-            {testingTTS ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Volume2 className="h-4 w-4" />
-            )}
-            {t('settings.testTTS')}
-          </Button>
-        </div>
-      </div>
+
+          {keyless && !use.inUse && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-sm">
+              <span className="min-w-0 text-muted-foreground">
+                {t('settings.serverConfig.notNarration')}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={assigning || !use.slot || use.slot.locked}
+                onClick={() => void makeNarration()}
+              >
+                {t('settings.serverConfig.useForNarration')}
+              </Button>
+            </div>
+          )}
+
+          {/* Test TTS */}
+          <div className="space-y-2">
+            <Label className="text-sm">{t('settings.testTTS')}</Label>
+            <div className="flex gap-2">
+              <Input
+                placeholder={t('settings.ttsTestTextPlaceholder')}
+                value={testText}
+                onChange={(e) => setTestText(e.target.value)}
+                className="flex-1"
+              />
+              <Button
+                onClick={() => void handleTestTTS()}
+                disabled={testingTTS || !testText.trim() || !configured}
+                size="default"
+                className="gap-2 w-32"
+              >
+                {testingTTS ? (
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                ) : (
+                  <Volume2 className="h-4 w-4" />
+                )}
+                {t('settings.testTTS')}
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
 
       {testMessage && (
         <div
@@ -350,11 +360,11 @@ export function TTSSettings({ selectedProviderId }: TTSSettingsProps) {
       )}
 
       {/* Available Models */}
-      {ttsProvider?.models?.length > 0 && (
+      {manuallySelectableModels.length > 0 && !isVoxCPM && (
         <div className="space-y-2">
           <Label className="text-sm text-muted-foreground">{t('settings.availableModels')}</Label>
           <div className="flex flex-wrap gap-2">
-            {ttsProvider.models.map((model) => (
+            {manuallySelectableModels.map((model) => (
               <div
                 key={model.id}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-muted/50 border border-border/40 text-xs font-mono text-muted-foreground"
@@ -370,174 +380,9 @@ export function TTSSettings({ selectedProviderId }: TTSSettingsProps) {
         </div>
       )}
 
-      {/* Custom Voice List Management */}
-      {isCustom && (
-        <div className="space-y-3">
-          <Label className="text-sm">{t('settings.customVoices')}</Label>
-          {(providerConfig?.customVoices as Array<{ id: string; name: string }> | undefined)
-            ?.length ? (
-            <div className="rounded-lg border border-border/60 overflow-hidden">
-              {/* Column headers */}
-              <div className="grid grid-cols-[1fr_1fr_36px] gap-0 bg-muted/40 px-3 py-1.5 border-b border-border/40">
-                <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
-                  ID
-                </span>
-                <span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wider">
-                  {t('settings.voiceNamePlaceholder')}
-                </span>
-                <span />
-              </div>
-              {/* Voice rows */}
-              {(
-                providerConfig?.customVoices as Array<{
-                  id: string;
-                  name: string;
-                }>
-              ).map((voice, index) => (
-                <div
-                  key={voice.id}
-                  className={cn(
-                    'grid grid-cols-[1fr_1fr_36px] gap-0 items-center px-3 py-2 group hover:bg-muted/20 transition-colors',
-                    index > 0 && 'border-t border-border/30',
-                  )}
-                >
-                  <span className="text-sm font-mono text-foreground/80 truncate pr-3">
-                    {voice.id}
-                  </span>
-                  <span className="text-sm text-foreground/60 truncate pr-3">{voice.name}</span>
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => {
-                      const voices = [
-                        ...(providerConfig?.customVoices as Array<{
-                          id: string;
-                          name: string;
-                        }>),
-                      ];
-                      voices.splice(index, 1);
-                      setTTSProviderConfig(selectedProviderId, {
-                        customVoices: voices,
-                      });
-                    }}
-                    className="h-7 w-7 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive"
-                  >
-                    <XCircle className="h-3.5 w-3.5" />
-                  </Button>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground/50 italic">{t('settings.noVoicesAdded')}</p>
-          )}
-          <AddVoiceRow
-            existingIds={(
-              (providerConfig?.customVoices as Array<{ id: string; name: string }> | undefined) ||
-              []
-            ).map((v) => v.id)}
-            onAdd={(voiceId, voiceName) => {
-              const voices = [
-                ...((providerConfig?.customVoices as
-                  | Array<{ id: string; name: string }>
-                  | undefined) || []),
-                { id: voiceId, name: voiceName },
-              ];
-              setTTSProviderConfig(selectedProviderId, {
-                customVoices: voices,
-              } as Record<string, unknown>);
-              // Auto-select the first voice if current voice is 'default'
-              if (ttsVoice === 'default' && selectedProviderId === activeProviderId) {
-                setTTSVoice(voiceId);
-              }
-            }}
-          />
-        </div>
-      )}
-
-      {/* Delete Custom Provider */}
-      {isCustom && (
-        <div className="pt-4 border-t">
-          <Button variant="destructive" size="sm" onClick={() => setShowDeleteConfirm(true)}>
-            {t('settings.deleteProvider')}
-          </Button>
-        </div>
-      )}
-
-      {/* Delete Confirmation Dialog */}
-      <AlertDialog
-        open={showDeleteConfirm}
-        onOpenChange={(open) => !open && setShowDeleteConfirm(false)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t('settings.deleteProvider')}</AlertDialogTitle>
-            <AlertDialogDescription>{t('settings.deleteProviderConfirm')}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>{t('settings.cancelEdit')}</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                removeCustomTTSProvider(selectedProviderId);
-                setShowDeleteConfirm(false);
-              }}
-            >
-              {t('settings.deleteProvider')}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-    </div>
-  );
-}
-
-function AddVoiceRow({
-  onAdd,
-  existingIds,
-}: {
-  onAdd: (id: string, name: string) => void;
-  existingIds: string[];
-}) {
-  const { t } = useI18n();
-  const [voiceId, setVoiceId] = useState('');
-  const [voiceName, setVoiceName] = useState('');
-
-  const handleAdd = () => {
-    if (!voiceId.trim()) return;
-    if (existingIds.includes(voiceId.trim())) {
-      toast.error('Duplicate ID');
-      return;
-    }
-    onAdd(voiceId.trim(), voiceName.trim() || voiceId.trim());
-    setVoiceId('');
-    setVoiceName('');
-  };
-
-  return (
-    <div className="grid grid-cols-[1fr_1fr_auto] gap-2 items-center">
-      <Input
-        value={voiceId}
-        onChange={(e) => setVoiceId(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-        className="text-sm font-mono"
-        placeholder={t('settings.voiceIdPlaceholder')}
-      />
-      <Input
-        value={voiceName}
-        onChange={(e) => setVoiceName(e.target.value)}
-        onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-        className="text-sm"
-        placeholder={t('settings.voiceNamePlaceholder')}
-      />
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={handleAdd}
-        disabled={!voiceId.trim()}
-        className="shrink-0 gap-1"
-      >
-        <Plus className="h-3.5 w-3.5" />
-        {t('settings.addVoice')}
-      </Button>
+      {/* The voices a user makes: for the workspace's narration service. */}
+      {isVoxCPM && use.inUse && <VoxCPMVoiceManager />}
+      {providerId === 'qwen-tts' && use.inUse && <QwenVoiceCloneManager />}
     </div>
   );
 }

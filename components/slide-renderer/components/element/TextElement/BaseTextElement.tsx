@@ -1,6 +1,8 @@
 'use client';
 
-import type { PPTTextElement } from '@/lib/types/slides';
+import { useRef } from 'react';
+import type { PPTTextElement } from '@openmaic/dsl';
+import { useInlineMath, useInnerHtml } from '@openmaic/renderer';
 import { useElementShadow } from '../hooks/useElementShadow';
 import { ElementOutline } from '../ElementOutline';
 
@@ -15,6 +17,9 @@ export interface BaseTextElementProps {
  */
 export function BaseTextElement({ elementInfo, target }: BaseTextElementProps) {
   const { shadowStyle } = useElementShadow(elementInfo.shadow);
+  const proseRef = useRef<HTMLDivElement>(null);
+  const innerHtml = useInnerHtml(elementInfo.content);
+  useInlineMath(proseRef, elementInfo.content);
 
   return (
     <div
@@ -28,15 +33,17 @@ export function BaseTextElement({ elementInfo, target }: BaseTextElementProps) {
     >
       <div
         className="rotate-wrapper w-full h-full"
-        style={{ transform: `rotate(${elementInfo.rotate}deg)` }}
+        style={{
+          transform: `rotate(${elementInfo.rotate}deg)`,
+          backgroundColor: elementInfo.fill,
+          opacity: elementInfo.opacity,
+        }}
       >
         <div
           className="element-content relative p-[10px] leading-[1.5] break-words"
           style={{
             width: elementInfo.vertical ? 'auto' : `${elementInfo.width}px`,
             height: elementInfo.vertical ? `${elementInfo.height}px` : 'auto',
-            backgroundColor: elementInfo.fill,
-            opacity: elementInfo.opacity,
             textShadow: shadowStyle,
             lineHeight: elementInfo.lineHeight,
             letterSpacing: `${elementInfo.wordSpace || 0}px`,
@@ -53,8 +60,10 @@ export function BaseTextElement({ elementInfo, target }: BaseTextElementProps) {
             outline={elementInfo.outline}
           />
           <div
+            ref={proseRef}
+            data-inline-math-root=""
             className={`text ProseMirror-static relative ${target === 'thumbnail' ? 'pointer-events-none' : ''}`}
-            dangerouslySetInnerHTML={{ __html: elementInfo.content }}
+            dangerouslySetInnerHTML={innerHtml}
           />
         </div>
       </div>

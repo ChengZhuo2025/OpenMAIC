@@ -2,9 +2,12 @@
  * Playback Types - Types for lecture playback and live discussion engine
  */
 
-import type { PlaybackSnapshot } from '@/lib/utils/playback-storage';
-
-export type { PlaybackSnapshot };
+export interface PlaybackSnapshot {
+  sceneIndex: number;
+  actionIndex: number;
+  consumedDiscussions: string[];
+  sceneId?: string;
+}
 
 /** Visual effects (for onEffectFire callback) */
 export type Effect =
@@ -27,6 +30,8 @@ export interface TriggerEvent {
 
 /** Playback engine callbacks */
 export interface PlaybackEngineCallbacks {
+  /** Notify frame media before narration, without waiting for a reply. */
+  beforeSpeech?: () => void;
   onModeChange?: (mode: EngineMode) => void;
   onSceneChange?: (sceneId: string) => void;
   onSpeechStart?: (text: string) => void;

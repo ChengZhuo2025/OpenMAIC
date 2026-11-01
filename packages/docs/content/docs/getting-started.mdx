@@ -1,0 +1,107 @@
+---
+title: Getting started
+description: Run OpenMAIC locally in five minutes.
+---
+
+OpenMAIC is a Next.js application that runs on your own machine. You need to configure at least one LLM provider: cloud providers usually require an API key, while local Ollama or Lemonade does not.
+
+## Prerequisites
+
+- **Node.js** 22.19.0 or later
+- **pnpm** 10.28.0 (if needed, run `npm install -g pnpm@10.28.0`)
+- At least one LLM provider; cloud providers usually require an API key, while local Ollama or Lemonade does not
+
+## Install
+
+Clone the repository and install dependencies:
+
+```bash
+git clone https://github.com/THU-MAIC/OpenMAIC.git
+cd OpenMAIC
+pnpm install
+```
+
+Installation builds the workspace packages required by the project, so the first install may take some time.
+
+## Configure
+
+Copy the example environment file and configure at least one LLM provider:
+
+```bash
+cp .env.example .env.local
+```
+
+Then configure a model. The simplest file setup is a minimal `openmaic.yml` next to `.env.local`, with the key in `.env.local`:
+
+```bash title=".env.local"
+OPENAI_API_KEY=sk-...
+```
+
+```yaml title="openmaic.yml"
+providers:
+  openai:
+    preset: openai
+    apiKey: ${OPENAI_API_KEY}
+
+slots:
+  llm: openai:gpt-5.5
+```
+
+`openmaic.example.yml` is this same starting point, with optional providers and slots commented out. Without the file, the legacy provider variables still work as long as `DEFAULT_MODEL` names the model:
+
+```bash title=".env.local"
+ANTHROPIC_API_KEY=sk-ant-...
+DEFAULT_MODEL=anthropic:claude-sonnet-4-6
+```
+
+To skip both, start the app and enter a plan's key in **Settings → Token Plan**, or a service's key in **Settings → Model Services**. Without `openmaic.yml`, `DEFAULT_MODEL` or a service set up there, no model is configured and generation fails.
+
+See [Configuration](./configuration.mdx) for complete provider, image/video generation, TTS, ASR, document parsing, web search, access control, and feature flag configuration.
+
+## Run
+
+Courses are stored in PostgreSQL, and the server refuses to start without `DATABASE_URL`. Start a local development database (a separate PostgreSQL in Docker on `127.0.0.1:5432`, shared by every checkout on this machine; set `OPENMAIC_DB_PORT` for another port) and set `DATABASE_URL` in `.env.local`:
+
+```bash
+pnpm db:up
+```
+
+```bash title=".env.local"
+DATABASE_URL=postgres://openmaic:openmaic-dev@127.0.0.1:5432/openmaic
+```
+
+Start the development server:
+
+```bash
+pnpm dev
+```
+
+Open [http://localhost:3000](http://localhost:3000). You should see the OpenMAIC classroom generator. Enter a topic or upload learning material, then click Generate; the AI teachers will build a complete, multi-scene classroom. Supported material formats depend on the selected parser and typically include PDF, Office documents, Markdown/plain text, images, and some audio/video formats. Consult the parser's supported formats for the exact range.
+
+## Export a classroom
+
+Once a classroom and its media have finished generating, the download button at the top right of the classroom opens the export menu:
+
+- **Export PPTX**: editable slides. **With placeholder slides (recommended)** keeps interactive, quiz and project-based learning scenes where they are in the lesson, each as a slide with an **Open online** button and a QR code that open the scene in the online classroom. **Slides only** leaves those scenes out.
+- **Export Resource Pack**: the same PPTX choice, plus each interactive scene as a self-contained web page.
+- **Export as HTML**: one self-contained file that plays the classroom without a network connection, with narration and captions, spotlight and laser, slide video, discussion cards and interactive scenes. Quiz, interactive and project scenes wait until the learner moves on. A project-based learning scene keeps only its briefing (goal and milestones); continuing the project needs the online classroom and a network connection. If the export reports assets it couldn't bundle, those parts of interactive scenes don't show in the offline HTML; they are still available in the online classroom. **With narration and video** plays like the classroom; **Without narration** makes a smaller file that paces the captions by reading time and leaves videos out.
+- **Export Classroom ZIP**: the course structure and media, to back the classroom up or import it on another OpenMAIC deployment.
+
+A classroom that would exceed 400 MB as one HTML file is saved as a ZIP instead: extract the whole ZIP and open `classroom.html`, keeping the `audio/`, `media/` and `images/` folders next to it.
+
+The exported HTML file needs a web browser with JavaScript. On a phone, open it in a browser such as Safari or Chrome: on iPhone it does not play inside WeChat or the Files preview.
+
+## Build for production
+
+```bash
+pnpm build
+DATABASE_URL=postgres://... pnpm start
+```
+
+Or deploy with Docker or on your own server—see the [Deployment guide](./deployment.mdx).
+
+## Next steps
+
+- [Configure providers, TTS, and ACCESS_CODE →](./configuration.mdx)
+- [Deploy with Docker or on your own server →](./deployment.mdx)
+- For architecture details or contribution guidance, visit [GitHub](https://github.com/THU-MAIC/OpenMAIC#-contributing)

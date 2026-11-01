@@ -3,10 +3,11 @@ import { initReactI18next } from 'react-i18next';
 import resourcesToBackend from 'i18next-resources-to-backend';
 import { supportedLocales } from './locales';
 import { defaultLocale } from './types';
+import { loadLocaleResource } from './load-resource';
 
 i18n
   .use(initReactI18next)
-  .use(resourcesToBackend((language: string) => import(`./locales/${language}.json`)))
+  .use(resourcesToBackend(loadLocaleResource))
   .init({
     lng: defaultLocale,
     fallbackLng: defaultLocale,

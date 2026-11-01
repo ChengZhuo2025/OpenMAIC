@@ -1,0 +1,242 @@
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
+import { useCanvasStore, useStageStore } from '@/lib/store';
+import { PENDING_SCENE_ID } from '@/lib/store/stage';
+import { isCurrentSceneEditable, resolveStageChromeMode } from '@/lib/edit/stage-mode';
+import { sceneEditorRegistry } from '@/lib/edit/scene-editor-registry';
+import type { SceneEditorSurface } from '@/lib/edit/scene-editor-surface';
+import type { SceneType } from '@/lib/types/stage';
+
+describe('stage edit mode store', () => {
+  beforeEach(() => {
+    useStageStore.getState().clearStore();
+    useCanvasStore.getState().resetCanvasState();
+  });
+
+  test('supports a global edit mode', () => {
+    useStageStore.getState().setMode('edit');
+
+    expect(useStageStore.getState().mode).toBe('edit');
+  });
+
+  test('clears canvas selection when leaving edit mode', () => {
+    useStageStore.getState().setMode('edit');
+    useCanvasStore.getState().setActiveElementIdList(['title']);
+    useCanvasStore.getState().setEditingElementId('title');
+
+    useStageStore.getState().setMode('playback');
+
+    expect(useCanvasStore.getState().activeElementIdList).toEqual([]);
+    expect(useCanvasStore.getState().handleElementId).toBe('');
+    expect(useCanvasStore.getState().editingElementId).toBe('');
+  });
+});
+
+describe('isCurrentSceneEditable', () => {
+  test('returns true when a real scene is resolved and nothing is generating', () => {
+    expect(
+      isCurrentSceneEditable({
+        currentSceneId: 'scene-1',
+        sceneCount: 3,
+        generatingOutlineCount: 0,
+        hasCurrentScene: true,
+      }),
+    ).toBe(true);
+  });
+
+  test('returns false on the pending placeholder scene', () => {
+    expect(
+      isCurrentSceneEditable({
+        currentSceneId: PENDING_SCENE_ID,
+        sceneCount: 3,
+        generatingOutlineCount: 0,
+        hasCurrentScene: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('returns false when no scenes have materialised yet', () => {
+    expect(
+      isCurrentSceneEditable({
+        currentSceneId: null,
+        sceneCount: 0,
+        generatingOutlineCount: 0,
+        hasCurrentScene: false,
+      }),
+    ).toBe(false);
+  });
+
+  test('returns false while outline generation is still in flight', () => {
+    expect(
+      isCurrentSceneEditable({
+        currentSceneId: 'scene-1',
+        sceneCount: 1,
+        generatingOutlineCount: 2,
+        hasCurrentScene: true,
+      }),
+    ).toBe(false);
+  });
+
+  test('returns false when current scene id does not resolve to a scene', () => {
+    expect(
+      isCurrentSceneEditable({
+        currentSceneId: 'scene-x',
+        sceneCount: 3,
+        generatingOutlineCount: 0,
+        hasCurrentScene: false,
+      }),
+    ).toBe(false);
+  });
+});
+
+describe('workspace classroom chrome', () => {
+  const eligible = {
+    storedMode: 'playback' as const,
+    hosted: true,
+    workbenchShowingClassroom: true,
+    workbenchLearning: false,
+    isEditable: true,
+    hasCurrentScene: true,
+    stageMatchesHost: true,
+    editorReady: true,
+    editorLoadFailed: false,
+  };
+
+  test('opens a hosted course in edit presentation even when the classroom store says playback', () => {
+    expect(resolveStageChromeMode(eligible)).toBe('edit');
+  });
+
+  test('the host can request embedded learning independently of stored mode', () => {
+    expect(resolveStageChromeMode({ ...eligible, workbenchLearning: true })).toBe('playback');
+  });
+
+  test('learning cannot render another course document during a switch', () => {
+    expect(
+      resolveStageChromeMode({ ...eligible, workbenchLearning: true, stageMatchesHost: false }),
+    ).toBe('loading');
+  });
+
+  test('standalone classrooms keep their own stored presentation', () => {
+    expect(resolveStageChromeMode({ ...eligible, hosted: false, storedMode: 'autonomous' })).toBe(
+      'autonomous',
+    );
+  });
+
+  test('a hosted course that is not editable yet waits instead of showing playback', () => {
+    // The agent has just created the course: the document is in the store but
+    // no scene has materialised, so the edit chrome has nothing to mount on.
+    expect(resolveStageChromeMode({ ...eligible, isEditable: false, hasCurrentScene: false })).toBe(
+      'loading',
+    );
+  });
+
+  test('a failed editor chunk never falls back to the learning chrome', () => {
+    expect(resolveStageChromeMode({ ...eligible, editorLoadFailed: true })).toBe('loading');
+  });
+
+  test('a folded pane drops the editor without mounting playback behind the fold', () => {
+    expect(resolveStageChromeMode({ ...eligible, workbenchShowingClassroom: false })).toBe(
+      'loading',
+    );
+  });
+
+  test('playback is unreachable without a host learning request', () => {
+    // Exhaustive over every other input: with `workbenchLearning` false, no
+    // combination of readiness, ownership or stored mode yields playback.
+    const booleans = [false, true];
+    for (const workbenchShowingClassroom of booleans) {
+      for (const isEditable of booleans) {
+        for (const hasCurrentScene of booleans) {
+          for (const stageMatchesHost of booleans) {
+            for (const editorReady of booleans) {
+              for (const editorLoadFailed of booleans) {
+                for (const storedMode of ['playback', 'edit', 'autonomous'] as const) {
+                  expect(
+                    resolveStageChromeMode({
+                      storedMode,
+                      hosted: true,
+                      workbenchLearning: false,
+                      workbenchShowingClassroom,
+                      isEditable,
+                      hasCurrentScene,
+                      stageMatchesHost,
+                      editorReady,
+                      editorLoadFailed,
+                    }),
+                  ).not.toBe('playback');
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+});
+
+describe('sceneEditorRegistry', () => {
+  function makeSurface(sceneType: SceneType, label = 'A'): SceneEditorSurface {
+    return {
+      sceneType,
+      SurfaceComponent: () => null,
+      useSurfaceState: () => ({
+        // Cast through unknown because tests don't need a real surface state;
+        // we only exercise the registry contract here.
+        content: { type: sceneType, label } as unknown as never,
+        selection: null,
+        hasSelection: false,
+        history: { canUndo: false, canRedo: false, undo: () => {}, redo: () => {} },
+        insertItems: [],
+        floatingActions: [],
+        commands: [],
+      }),
+    };
+  }
+
+  afterEach(() => {
+    sceneEditorRegistry.unregister('slide');
+    sceneEditorRegistry.unregister('quiz');
+  });
+
+  test('register and resolve round-trip by sceneType', () => {
+    const surface = makeSurface('slide');
+    sceneEditorRegistry.register(surface);
+    expect(sceneEditorRegistry.resolve('slide')).toBe(surface);
+  });
+
+  test('resolve returns undefined for unregistered sceneType', () => {
+    expect(sceneEditorRegistry.resolve('pbl')).toBeUndefined();
+  });
+
+  test('re-registering the identical surface instance does not warn (HMR-safe)', () => {
+    const surface = makeSurface('slide');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    sceneEditorRegistry.register(surface);
+    sceneEditorRegistry.register(surface);
+
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  test('registering a different surface for the same sceneType warns in dev', () => {
+    const first = makeSurface('slide', 'A');
+    const second = makeSurface('slide', 'B');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    sceneEditorRegistry.register(first);
+    sceneEditorRegistry.register(second);
+
+    expect(warn).toHaveBeenCalledOnce();
+    expect(sceneEditorRegistry.resolve('slide')).toBe(second);
+    warn.mockRestore();
+  });
+
+  test('unregister removes the surface', () => {
+    const surface = makeSurface('quiz');
+    sceneEditorRegistry.register(surface);
+    expect(sceneEditorRegistry.resolve('quiz')).toBe(surface);
+
+    sceneEditorRegistry.unregister('quiz');
+    expect(sceneEditorRegistry.resolve('quiz')).toBeUndefined();
+  });
+});

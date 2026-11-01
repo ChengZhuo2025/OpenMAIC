@@ -1,0 +1,394 @@
+import { describe, expect, it, vi, beforeEach } from 'vitest';
+
+describe('server web search config', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.unstubAllEnvs();
+    delete process.env.TAVILY_API_KEY;
+    delete process.env.TAVILY_BASE_URL;
+    delete process.env.EXA_API_KEY;
+    delete process.env.EXA_BASE_URL;
+    delete process.env.FIRECRAWL_API_KEY;
+    delete process.env.FIRECRAWL_BASE_URL;
+    delete process.env.BOCHA_API_KEY;
+    delete process.env.BOCHA_BASE_URL;
+    delete process.env.BRAVE_API_KEY;
+    delete process.env.BRAVE_BASE_URL;
+    delete process.env.BAIDU_API_KEY;
+    delete process.env.BAIDU_BASE_URL;
+    delete process.env.WEB_SEARCH_MINIMAX_API_KEY;
+    delete process.env.WEB_SEARCH_MINIMAX_BASE_URL;
+    delete process.env.WEB_SEARCH_CLAUDE_API_KEY;
+    delete process.env.WEB_SEARCH_CLAUDE_BASE_URL;
+    delete process.env.WEB_SEARCH_CLAUDE_MODELS;
+    delete process.env.SEARXNG_BASE_URL;
+    delete process.env.KIMI_API_KEY;
+    delete process.env.KIMI_BASE_URL;
+    delete process.env.WEB_SEARCH_KIMI_ENABLED;
+  });
+
+  it('rejects client-controlled base URLs outside the provider allowlist', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+
+    expect(() =>
+      resolveSafeClientWebSearchBaseUrl('bocha', 'http://127.0.0.1:3000/internal'),
+    ).toThrow('Unsupported Bocha base URL');
+  });
+
+  it('allows official Bocha client base URLs', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+
+    expect(resolveSafeClientWebSearchBaseUrl('bocha', 'https://api.bochaai.com/v1')).toBe(
+      'https://api.bochaai.com/v1',
+    );
+  });
+
+  it('allows the web-search base URL every built-in token plan writes to client settings', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+    const { TOKEN_PLAN_PRESETS } = await import('@/lib/config/token-plan-presets');
+    const targets = TOKEN_PLAN_PRESETS.flatMap((preset) =>
+      preset.modalities.webSearch ? [preset.modalities.webSearch] : [],
+    );
+
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) {
+      expect(
+        resolveSafeClientWebSearchBaseUrl(
+          target.providerId as Parameters<typeof resolveSafeClientWebSearchBaseUrl>[0],
+          target.baseUrl,
+        ),
+      ).toBe(target.baseUrl.replace(/\/+$/, ''));
+    }
+    expect(() =>
+      resolveSafeClientWebSearchBaseUrl('bocha', 'https://tokendance.space/gateway/other'),
+    ).toThrow('Unsupported Bocha base URL');
+  });
+
+  it('allows official Exa client base URLs and resolves client credentials', async () => {
+    const { resolveClassroomWebSearchConfig, resolveSafeClientWebSearchBaseUrl } =
+      await import('@/lib/server/web-search-config');
+
+    expect(resolveSafeClientWebSearchBaseUrl('exa', 'https://api.exa.ai/search')).toBe(
+      'https://api.exa.ai/search',
+    );
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'exa',
+        webSearchApiKey: 'exa-client-key',
+        webSearchBaseUrl: 'https://api.exa.ai',
+      }),
+    ).toEqual({
+      providerId: 'exa',
+      apiKey: 'exa-client-key',
+      baseUrl: 'https://api.exa.ai',
+    });
+  });
+
+  it('resolves Exa classroom config from server environment variables', async () => {
+    vi.stubEnv('EXA_API_KEY', 'exa-server-key');
+    vi.stubEnv('EXA_BASE_URL', 'https://proxy.example.com/exa');
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(await resolveClassroomWebSearchConfig(null, { webSearchProviderId: 'exa' })).toEqual({
+      providerId: 'exa',
+      apiKey: 'exa-server-key',
+      baseUrl: 'https://proxy.example.com/exa',
+    });
+  });
+
+  it('allows official Firecrawl client base URLs and resolves client credentials', async () => {
+    const { resolveClassroomWebSearchConfig, resolveSafeClientWebSearchBaseUrl } =
+      await import('@/lib/server/web-search-config');
+
+    expect(
+      resolveSafeClientWebSearchBaseUrl('firecrawl', 'https://api.firecrawl.dev/v2/search'),
+    ).toBe('https://api.firecrawl.dev/v2/search');
+    expect(() => resolveSafeClientWebSearchBaseUrl('firecrawl', 'http://127.0.0.1:3002')).toThrow(
+      'Unsupported Firecrawl base URL',
+    );
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'firecrawl',
+        webSearchApiKey: 'fc-client-key',
+        webSearchBaseUrl: 'https://api.firecrawl.dev',
+      }),
+    ).toEqual({
+      providerId: 'firecrawl',
+      apiKey: 'fc-client-key',
+      baseUrl: 'https://api.firecrawl.dev',
+    });
+  });
+
+  it('resolves Firecrawl classroom config from server environment variables', async () => {
+    vi.stubEnv('FIRECRAWL_API_KEY', 'fc-server-key');
+    vi.stubEnv('FIRECRAWL_BASE_URL', 'https://firecrawl.internal');
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, { webSearchProviderId: 'firecrawl' }),
+    ).toEqual({
+      providerId: 'firecrawl',
+      apiKey: 'fc-server-key',
+      baseUrl: 'https://firecrawl.internal',
+    });
+  });
+
+  it('allows official MiniMax client base URLs', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+
+    expect(
+      resolveSafeClientWebSearchBaseUrl(
+        'minimax',
+        'https://api.minimaxi.com/v1/coding_plan/search',
+      ),
+    ).toBe('https://api.minimaxi.com/v1/coding_plan/search');
+  });
+
+  it('resolves classroom web search config from selected provider and client key', async () => {
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'bocha',
+        webSearchApiKey: 'bocha-client-key',
+        webSearchBaseUrl: 'https://api.bochaai.com/v1',
+      }),
+    ).toEqual({
+      providerId: 'bocha',
+      apiKey: 'bocha-client-key',
+      baseUrl: 'https://api.bochaai.com/v1',
+    });
+  });
+
+  it("keeps a classroom request's own provider and key over the server's configured one", async () => {
+    vi.stubEnv('TAVILY_API_KEY', 'server-tavily');
+    const { resolveClassroomWebSearchConfig, resolveWebSearchConnection } =
+      await import('@/lib/server/web-search-config');
+    const requested = { webSearchProviderId: 'exa' as const, webSearchApiKey: 'exa-client-key' };
+
+    expect(await resolveClassroomWebSearchConfig(null, requested)).toMatchObject({
+      providerId: 'exa',
+      apiKey: 'exa-client-key',
+    });
+    // The 1.1.x /api/web-search route preferred the operator's backend.
+    expect(
+      await resolveWebSearchConnection(null, requested, { preferServerProvider: true }),
+    ).toMatchObject({ providerId: 'tavily', apiKey: 'server-tavily' });
+  });
+
+  it('rejects unsupported client base URLs at the classroom server boundary', async () => {
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    await expect(
+      resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'bocha',
+        webSearchApiKey: 'bocha-client-key',
+        webSearchBaseUrl: 'https://evil.example.com/steal-key',
+      }),
+    ).rejects.toThrow('Unsupported Bocha base URL');
+  });
+
+  it('uses server base URL for classroom web search config instead of client-controlled URLs', async () => {
+    vi.stubEnv('BOCHA_API_KEY', 'bocha-server-key');
+    vi.stubEnv('BOCHA_BASE_URL', 'http://internal-proxy.local/bocha');
+
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'bocha',
+        webSearchApiKey: 'stale-client-key',
+        webSearchBaseUrl: 'https://api.bochaai.com/v1',
+      }),
+    ).toEqual({
+      providerId: 'bocha',
+      apiKey: 'bocha-server-key',
+      baseUrl: 'http://internal-proxy.local/bocha',
+    });
+  });
+
+  it('resolves Brave classroom web search config without an API key', async () => {
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(await resolveClassroomWebSearchConfig(null, { webSearchProviderId: 'brave' })).toEqual({
+      providerId: 'brave',
+      apiKey: '',
+      baseUrl: undefined,
+    });
+  });
+
+  it('resolves MiniMax classroom web search config from dedicated server env vars', async () => {
+    vi.stubEnv('WEB_SEARCH_MINIMAX_API_KEY', 'minimax-server-key');
+    vi.stubEnv('WEB_SEARCH_MINIMAX_BASE_URL', 'https://api.minimaxi.com');
+
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(await resolveClassroomWebSearchConfig(null, { webSearchProviderId: 'minimax' })).toEqual(
+      {
+        providerId: 'minimax',
+        apiKey: 'minimax-server-key',
+        baseUrl: 'https://api.minimaxi.com',
+      },
+    );
+  });
+
+  it('allows official Claude client base URLs and rejects others', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+
+    expect(resolveSafeClientWebSearchBaseUrl('claude', 'https://api.anthropic.com/v1')).toBe(
+      'https://api.anthropic.com/v1',
+    );
+    expect(resolveSafeClientWebSearchBaseUrl('claude', 'https://api.anthropic.com/')).toBe(
+      'https://api.anthropic.com',
+    );
+    expect(() =>
+      resolveSafeClientWebSearchBaseUrl('claude', 'https://evil.example.com/v1'),
+    ).toThrow('Unsupported Claude base URL');
+  });
+
+  it('resolves Claude classroom web search config with the client-selected model', async () => {
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'claude',
+        webSearchApiKey: 'sk-client-key',
+        webSearchModelId: 'claude-opus-5',
+      }),
+    ).toEqual({
+      providerId: 'claude',
+      apiKey: 'sk-client-key',
+      baseUrl: undefined,
+      claudeModelId: 'claude-opus-5',
+    });
+  });
+
+  it("applies the request's Claude model to the server's default search provider", async () => {
+    vi.stubEnv('WEB_SEARCH_CLAUDE_API_KEY', 'sk-server-key');
+    vi.stubEnv('WEB_SEARCH_CLAUDE_MODELS', 'claude-opus-5');
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, { webSearchModelId: 'claude-opus-5' }),
+    ).toMatchObject({ providerId: 'claude', claudeModelId: 'claude-opus-5' });
+  });
+
+  it('refuses an unlisted Claude model instead of substituting a server model', async () => {
+    vi.stubEnv('WEB_SEARCH_CLAUDE_API_KEY', 'sk-server-key');
+    vi.stubEnv('WEB_SEARCH_CLAUDE_BASE_URL', 'https://api.anthropic.com/v1');
+    vi.stubEnv('WEB_SEARCH_CLAUDE_MODELS', 'claude-sonnet-5,claude-opus-5');
+
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    await expect(
+      resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'claude',
+        webSearchModelId: 'claude-haiku-4-5',
+      }),
+    ).rejects.toThrow('not authorized');
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'claude',
+        webSearchModelId: 'claude-opus-5',
+      }),
+    ).toMatchObject({ providerId: 'claude', claudeModelId: 'claude-opus-5' });
+  });
+
+  it.each([
+    'http://127.0.0.1:6060',
+    'http://localhost:6060',
+    'http://169.254.169.254',
+    'http://192.168.161.100:6060/search',
+  ])('rejects client-supplied SearXNG base URLs (%s)', async (baseUrl) => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+
+    expect(() => resolveSafeClientWebSearchBaseUrl('searxng', baseUrl)).toThrow(
+      'Unsupported SearXNG base URL',
+    );
+  });
+
+  it('resolves SearXNG classroom web search config from server base URL', async () => {
+    vi.stubEnv('SEARXNG_BASE_URL', 'http://192.168.161.100:6060');
+
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(await resolveClassroomWebSearchConfig(null, { webSearchProviderId: 'searxng' })).toEqual(
+      {
+        providerId: 'searxng',
+        apiKey: '',
+        baseUrl: 'http://192.168.161.100:6060',
+      },
+    );
+  });
+
+  it('returns undefined for SearXNG classroom config without a base URL', async () => {
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, { webSearchProviderId: 'searxng' }),
+    ).toBeUndefined();
+  });
+
+  it('keeps Baidu sub-source toggles in classroom web search config', async () => {
+    vi.stubEnv('BAIDU_API_KEY', 'baidu-server-key');
+
+    const { resolveClassroomWebSearchConfig } = await import('@/lib/server/web-search-config');
+
+    expect(
+      await resolveClassroomWebSearchConfig(null, {
+        webSearchProviderId: 'baidu',
+        baiduSubSources: { webSearch: false, baike: true, scholar: false },
+      }),
+    ).toEqual({
+      providerId: 'baidu',
+      apiKey: 'baidu-server-key',
+      baseUrl: undefined,
+      baiduSubSources: { webSearch: false, baike: true, scholar: false },
+    });
+  });
+});
+
+describe('Kimi official search bases', () => {
+  it.each([
+    'https://api.moonshot.cn/v1',
+    'https://api.moonshot.ai/v1',
+    'https://api.kimi.com/coding/v1',
+    'https://api.kimi.ai/coding/v1',
+  ])('accepts %s', async (baseUrl) => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+    expect(resolveSafeClientWebSearchBaseUrl('kimi', baseUrl)).toBe(baseUrl);
+  });
+  it('rejects lookalike endpoints', async () => {
+    const { resolveSafeClientWebSearchBaseUrl } = await import('@/lib/server/web-search-config');
+    expect(() =>
+      resolveSafeClientWebSearchBaseUrl('kimi', 'https://api.kimi.com.openmaic.test/coding/v1'),
+    ).toThrow('Unsupported Kimi base URL');
+  });
+});
+
+describe('chat-only Kimi search requests', () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.unstubAllEnvs();
+    vi.stubEnv('KIMI_API_KEY', 'operator-chat-key');
+    vi.stubEnv('WEB_SEARCH_KIMI_ENABLED', '');
+    vi.stubEnv('TAVILY_API_KEY', '');
+    vi.stubEnv('SEARXNG_BASE_URL', '');
+  });
+
+  it('does not redirect a user Tavily request to the operator chat account', async () => {
+    const { resolveWebSearchConnection, resolveClassroomWebSearchConfig } =
+      await import('@/lib/server/web-search-config');
+    expect(await resolveClassroomWebSearchConfig(null)).toBeUndefined();
+    expect(
+      await resolveWebSearchConnection(
+        null,
+        {
+          webSearchProviderId: 'tavily',
+          webSearchApiKey: 'user-search-key',
+        },
+        { preferServerProvider: true },
+      ),
+    ).toMatchObject({ providerId: 'tavily', apiKey: 'user-search-key' });
+  });
+});

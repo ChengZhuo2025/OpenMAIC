@@ -1,0 +1,105 @@
+name: Storage PostgreSQL Contract
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main, runtime-server-backend, feat/maic-editor-v0, feat/maic-editor-v1, integration/material-library]
+
+concurrency:
+  group: storage-pg-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  storage-pg-contract:
+    name: Storage Contract (PostgreSQL 16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: openmaic
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d openmaic"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      PG_CONTRACT_URL: postgresql://postgres:postgres@localhost:5432/openmaic
+      STORAGE_PG_CONTRACT_REQUIRED: '1'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: ./.github/actions/setup-workspace
+
+      # Baseline, then the run, then the audit against that baseline. The
+      # in-module STORAGE_PG_CONTRACT_REQUIRED guard only covers a missing
+      # database: it is a `throw` inside the test modules, so it cannot fire if
+      # vitest stops collecting them, and collection is decided by storage's
+      # vitest.config.ts — a file no publishable-input rule covers, so excluding
+      # `*.pg.test.ts` there would silence this whole job while it still
+      # reported success.
+      - name: Storage PostgreSQL contract
+        env:
+          STORAGE_VITEST_RESULTS: ${{ runner.temp }}/storage-vitest.json
+          STORAGE_PG_BASELINE: ${{ runner.temp }}/storage-pg-baseline.json
+        run: |
+          set -euo pipefail
+          node scripts/assert-pg-contract-suites.mjs --capture-baseline "$STORAGE_PG_BASELINE"
+          pnpm --filter @openmaic/storage exec \
+            vitest run --reporter=default --reporter=json \
+            --outputFile.json="$STORAGE_VITEST_RESULTS"
+          node scripts/assert-pg-contract-suites.mjs "$STORAGE_VITEST_RESULTS" \
+            --baseline "$STORAGE_PG_BASELINE"
+
+      # App-domain PostgreSQL contracts, on the same server as the package
+      # suite above. Each vitest worker runs them in a database of its own,
+      # derived from PG_CONTRACT_URL (tests/pg-contract-database.ts): advisory
+      # locks are database-wide, so files running side by side in one database
+      # waited on each other's owner and bootstrap locks. Each file still works
+      # inside a schema or database of its own, or truncates only tables of its
+      # own, since files share their worker's database one after another; the
+      # asset ones provision `stage_meta`, whose foreign key to
+      # `document_stages` would break the package suite's non-cascading
+      # TRUNCATE in a shared database. This list is every app `*.pg.test.ts`:
+      # a suite left off it skips everywhere, since no other job runs the app
+      # suites against a database.
+      - name: App-domain PostgreSQL contracts
+        # These suites create schemas and run races against a shared database
+        # service, so a test can take several seconds on a busy runner. The
+        # default 5 s test/hook timeout made unrelated PRs fail intermittently.
+        run: |
+          pnpm exec vitest run --testTimeout=30000 --hookTimeout=30000 \
+            tests/lib/whiteboard/runtime-store.pg.test.ts \
+            tests/persistence/document-asset-references.pg.test.ts \
+            tests/persistence/asset-reference-backfill.pg.test.ts \
+            tests/persistence/workbench-tool-asset-references.pg.test.ts \
+            tests/persistence/host-create-hooks.pg.test.ts \
+            tests/persistence/stage-meta-tenancy.pg.test.ts \
+            tests/persistence/schema-bootstrap-concurrency.pg.test.ts \
+            tests/persistence/schema-migrations.pg.test.ts \
+            tests/persistence/owner-claims.pg.test.ts \
+            tests/persistence/owner-assets-legacy-race.pg.test.ts \
+            tests/persistence/owner-materials.pg.test.ts \
+            tests/persistence/owner-material-extraction.pg.test.ts \
+            tests/persistence/owner-material-pool.pg.test.ts \
+            tests/persistence/material-library.pg.test.ts \
+            tests/persistence/workspace-model-config.pg.test.ts \
+            tests/server/agents/owner-agents.pg.test.ts \
+            tests/persistence/runtime-tombstone-collision.pg.test.ts \
+            tests/agent-runtime/event-notify.pg.test.ts \
+            tests/agent-runtime/park-attempt-budget.pg.test.ts \
+            tests/agent-runtime/session-events-live.pg.test.ts \
+            tests/agent-runtime/prior-run-record.pg.test.ts \
+            tests/legacy-browser-import/import-routes.pg.test.ts \
+            tests/server/classroom-persistence.pg.test.ts \
+            tests/server/generate-classroom-api.pg.test.ts \
+            tests/server/generation-runs.pg.test.ts \
+            tests/server/generation-run-hooks.pg.test.ts \
+            tests/server/material-extraction.pg.test.ts \
+            tests/server/legacy-classroom-import.pg.test.ts \
+            tests/persistence/exclusive-create-invariant.pg.test.ts

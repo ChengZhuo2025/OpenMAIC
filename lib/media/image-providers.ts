@@ -21,6 +21,20 @@ import {
   testMiniMaxImageConnectivity,
 } from './adapters/minimax-image-adapter';
 import { generateWithGrokImage, testGrokImageConnectivity } from './adapters/grok-image-adapter';
+import { generateWithGlmImage, testGlmImageConnectivity } from './adapters/glm-image-adapter';
+import {
+  generateWithComfyuiImage,
+  testComfyuiImageConnectivity,
+} from './adapters/comfyui-image-adapter';
+import {
+  generateWithLemonadeImage,
+  testLemonadeImageConnectivity,
+} from './adapters/lemonade-image-adapter';
+import {
+  generateWithOpenRouterImage,
+  testOpenRouterImageConnectivity,
+  OPENROUTER_DEFAULT_BASE_URL,
+} from './adapters/openrouter-image-adapter';
 
 export const IMAGE_PROVIDERS: Record<ImageProviderId, ImageProviderConfig> = {
   seedream: {
@@ -30,9 +44,9 @@ export const IMAGE_PROVIDERS: Record<ImageProviderId, ImageProviderConfig> = {
     defaultBaseUrl: 'https://ark.cn-beijing.volces.com',
     models: [
       { id: 'doubao-seedream-5-0-260128', name: 'Seedream 5.0 Lite' },
+      { id: 'doubao-seedream-5-0-lite-260128', name: 'Seedream 5.0 Lite (Alias)' },
       { id: 'doubao-seedream-4-5-251128', name: 'Seedream 4.5' },
       { id: 'doubao-seedream-4-0-250828', name: 'Seedream 4.0' },
-      { id: 'doubao-seedream-3-0-t2i-250415', name: 'Seedream 3.0' },
     ],
     supportedAspectRatios: ['16:9', '4:3', '1:1', '9:16'],
   },
@@ -57,18 +71,11 @@ export const IMAGE_PROVIDERS: Record<ImageProviderId, ImageProviderConfig> = {
     requiresApiKey: true,
     defaultBaseUrl: 'https://dashscope.aliyuncs.com',
     models: [
+      { id: 'qwen-image-3.0', name: 'Qwen Image 3.0' },
       { id: 'qwen-image-2.0-pro', name: 'Qwen Image 2.0 Pro' },
       { id: 'qwen-image-2.0-pro-2026-03-03', name: 'Qwen Image 2.0 Pro (2026-03-03)' },
       { id: 'qwen-image-2.0', name: 'Qwen Image 2.0' },
       { id: 'qwen-image-2.0-2026-03-03', name: 'Qwen Image 2.0 (2026-03-03)' },
-      { id: 'qwen-image-max', name: 'Qwen Image Max' },
-      { id: 'qwen-image-max-2025-12-30', name: 'Qwen Image Max (2025-12-30)' },
-      { id: 'qwen-image-plus', name: 'Qwen Image Plus' },
-      {
-        id: 'qwen-image-plus-2026-01-09',
-        name: 'Qwen Image Plus (2026-01-09)',
-      },
-      { id: 'qwen-image', name: 'Qwen Image' },
       { id: 'z-image-turbo', name: 'Z-Image Turbo' },
     ],
     supportedAspectRatios: ['16:9', '4:3', '1:1', '9:16'],
@@ -79,14 +86,8 @@ export const IMAGE_PROVIDERS: Record<ImageProviderId, ImageProviderConfig> = {
     requiresApiKey: true,
     defaultBaseUrl: 'https://generativelanguage.googleapis.com',
     models: [
-      {
-        id: 'gemini-3.1-flash-image-preview',
-        name: 'Gemini 3.1 Flash Image (Nano Banana 2)',
-      },
-      {
-        id: 'gemini-3-pro-image-preview',
-        name: 'Gemini 3 Pro Image (Nano Banana Pro)',
-      },
+      { id: 'gemini-nano-banana-2.1', name: 'Nano Banana 2.1' },
+      { id: 'gemini-3-pro-image', name: 'Gemini 3 Pro Image (Nano Banana Pro)' },
       {
         id: 'gemini-2.5-flash-image',
         name: 'Gemini 2.5 Flash Image (Nano Banana)',
@@ -110,9 +111,65 @@ export const IMAGE_PROVIDERS: Record<ImageProviderId, ImageProviderConfig> = {
     name: 'Grok Image (xAI)',
     requiresApiKey: true,
     defaultBaseUrl: 'https://api.x.ai/v1',
+    models: [{ id: 'grok-imagine-image', name: 'Grok Imagine Image' }],
+    supportedAspectRatios: ['16:9', '4:3', '1:1', '9:16'],
+  },
+  'glm-image': {
+    id: 'glm-image',
+    name: 'GLM Image (Zhipu)',
+    requiresApiKey: true,
+    defaultBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+    icon: '/logos/glm.svg',
     models: [
-      { id: 'grok-imagine-image', name: 'Grok Imagine Image' },
-      { id: 'grok-imagine-image-pro', name: 'Grok Imagine Image Pro' },
+      { id: 'cogview-3-flash', name: 'CogView-3-Flash' },
+      { id: 'cogview-4', name: 'CogView-4' },
+    ],
+    supportedAspectRatios: ['1:1', '4:3', '3:4', '16:9', '9:16'],
+  },
+  'comfyui-image': {
+    id: 'comfyui-image',
+    name: 'ComfyUI Image',
+    requiresApiKey: false,
+    defaultBaseUrl: 'http://localhost:8188',
+    // No static models here — real selectable workflows are discovered at
+    // runtime from GET /api/comfyui-workflows (files in public/) and picked
+    // in Settings. A placeholder id like "comfyui-image" doesn't correspond
+    // to any real workflow file, so resolveSelectedModel() would resolve it
+    // to a dead path the first time this provider became active (#P2).
+    // With models: [], imageModelId resolves to '' when this provider is
+    // selected with no workflow chosen yet. In that case (and on the
+    // autonomous classroom-media path, which has no model id to pass) the
+    // adapter's loadWorkflow() defaults to the first workflow file discovered
+    // in public/ via listComfyuiWorkflowFilenames() — not a hard-coded
+    // filename, since no particular workflow name is guaranteed to exist.
+    models: [],
+    supportedAspectRatios: ['16:9', '4:3', '1:1', '9:16'],
+    maxResolution: { width: 1920, height: 1920 },
+  },
+  lemonade: {
+    id: 'lemonade',
+    name: 'Lemonade',
+    requiresApiKey: false,
+    defaultBaseUrl: 'http://localhost:13305/v1',
+    icon: '/logos/lemonade.svg',
+    models: [
+      { id: 'Qwen-Image-GGUF', name: 'Qwen Image GGUF' },
+      { id: 'sd-cpp', name: 'Stable Diffusion (sd-cpp)' },
+    ],
+    supportedAspectRatios: ['16:9', '4:3', '1:1', '9:16'],
+    maxResolution: { width: 1024, height: 1024 },
+  },
+  'openrouter-image': {
+    id: 'openrouter-image',
+    name: 'OpenRouter Image',
+    requiresApiKey: true,
+    defaultBaseUrl: OPENROUTER_DEFAULT_BASE_URL,
+    // Model list is fetched live from OpenRouter's public GET /images/models
+    // catalog; this seed keeps the picker usable offline.
+    models: [
+      { id: 'google/gemini-3-pro-image', name: 'Gemini 3 Pro Image' },
+      { id: 'openai/gpt-image-2', name: 'GPT Image 2' },
+      { id: 'bytedance-seed/seedream-5-0-pro', name: 'Seedream 5.0 Pro' },
     ],
     supportedAspectRatios: ['16:9', '4:3', '1:1', '9:16'],
   },
@@ -134,6 +191,14 @@ export async function testImageConnectivity(
       return testMiniMaxImageConnectivity(config);
     case 'grok-image':
       return testGrokImageConnectivity(config);
+    case 'glm-image':
+      return testGlmImageConnectivity(config);
+    case 'comfyui-image':
+      return testComfyuiImageConnectivity(config);
+    case 'lemonade':
+      return testLemonadeImageConnectivity(config);
+    case 'openrouter-image':
+      return testOpenRouterImageConnectivity(config);
     default:
       return {
         success: false,
@@ -159,6 +224,14 @@ export async function generateImage(
       return generateWithMiniMaxImage(config, options);
     case 'grok-image':
       return generateWithGrokImage(config, options);
+    case 'glm-image':
+      return generateWithGlmImage(config, options);
+    case 'comfyui-image':
+      return generateWithComfyuiImage(config, options);
+    case 'lemonade':
+      return generateWithLemonadeImage(config, options);
+    case 'openrouter-image':
+      return generateWithOpenRouterImage(config, options);
     default:
       throw new Error(`Unsupported image provider: ${config.providerId}`);
   }
@@ -171,4 +244,25 @@ export function aspectRatioToDimensions(
   const [w, h] = ratio.split(':').map(Number);
   if (!w || !h) return { width: maxWidth, height: Math.round((maxWidth * 9) / 16) };
   return { width: maxWidth, height: Math.round((maxWidth * h) / w) };
+}
+
+/**
+ * Scale a width/height pair up to a minimum pixel area while preserving the
+ * aspect ratio, rounding both edges up to a multiple of 8 (common provider
+ * alignment). A no-op for a non-positive floor or degenerate dimensions.
+ */
+export function applyMinPixelFloor(
+  width: number,
+  height: number,
+  minPixels: number,
+): { width: number; height: number } {
+  if (!(minPixels > 0) || width <= 0 || height <= 0) return { width, height };
+  const area = width * height;
+  if (area >= minPixels) return { width, height };
+
+  const scale = Math.sqrt(minPixels / area);
+  return {
+    width: Math.ceil((width * scale) / 8) * 8,
+    height: Math.ceil((height * scale) / 8) * 8,
+  };
 }

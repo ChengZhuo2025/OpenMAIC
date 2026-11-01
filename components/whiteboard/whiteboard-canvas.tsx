@@ -6,15 +6,21 @@ import {
   useEffect,
   useCallback,
   useMemo,
+  memo,
   forwardRef,
   useImperativeHandle,
 } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { useStageStore } from '@/lib/store';
 import { useCanvasStore } from '@/lib/store/canvas';
 import { ScreenElement } from '@/components/slide-renderer/Editor/ScreenElement';
-import type { PPTElement } from '@/lib/types/slides';
+import { normalizeWhiteboardViewportRatio } from '@/lib/whiteboard/viewport';
+import { ElementTypes, type PPTElement, type Whiteboard } from '@openmaic/dsl';
 import { useI18n } from '@/lib/hooks/use-i18n';
+import { createTextProseStyles } from '@openmaic/renderer';
+
+const WHITEBOARD_SHAPE_PROSE_STYLES = createTextProseStyles(
+  '.whiteboard-screen-canvas .screen-element .slide-renderer-prose',
+);
 
 export type WhiteboardCanvasHandle = {
   resetView: () => void;
@@ -33,7 +39,7 @@ type InteractiveWhiteboardCanvasProps = {
   readyText: string;
 };
 
-function AnimatedElement({
+function AnimatedElementBase({
   element,
   index,
   isClearing,
@@ -46,6 +52,7 @@ function AnimatedElement({
 }) {
   const clearDelay = isClearing ? (totalElements - 1 - index) * 0.055 : 0;
   const clearRotate = isClearing ? (index % 2 === 0 ? 1 : -1) * (2 + index * 0.4) : 0;
+  const isSelectable = element.type === ElementTypes.TEXT || element.type === ElementTypes.CODE;
 
   return (
     <motion.div
@@ -83,15 +90,32 @@ function AnimatedElement({
         scale: 0.85,
         transition: { duration: 0.2 },
       }}
-      className="absolute inset-0"
-      style={{ pointerEvents: isClearing ? 'none' : undefined }}
+      className="absolute inset-0 pointer-events-none"
+      style={{ pointerEvents: 'none' }}
     >
-      <div style={{ pointerEvents: 'auto' }}>
-        <ScreenElement elementInfo={element} elementIndex={index} animate />
+      <div
+        className={isSelectable ? 'select-text cursor-text' : undefined}
+        style={{ pointerEvents: isClearing ? 'none' : 'auto' }}
+        onPointerDown={isSelectable ? (e) => e.stopPropagation() : undefined}
+        onDoubleClick={isSelectable ? (e) => e.stopPropagation() : undefined}
+      >
+        <ScreenElement
+          elementInfo={element}
+          elementIndex={index}
+          animate
+          selectable={isSelectable}
+        />
       </div>
     </motion.div>
   );
 }
+
+// Memoized so whiteboard pan/zoom state changes (which rerender the parent
+// on every pointer/wheel event) do not cascade into ScreenElement rerenders.
+// Without this, motion's projection system inside CodeLineRow remeasures
+// against the panning parent transform and animates the diff, making code
+// content visibly lag behind the surrounding element box during a pan.
+const AnimatedElement = memo(AnimatedElementBase);
 
 const InteractiveWhiteboardCanvas = forwardRef<
   WhiteboardCanvasHandle,
@@ -180,6 +204,7 @@ const InteractiveWhiteboardCanvas = forwardRef<
       }
 
       e.preventDefault();
+      window.getSelection()?.removeAllRanges();
       setIsPanning(true);
       panStartRef.current = { x: e.clientX, y: e.clientY, panX, panY };
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
@@ -378,23 +403,26 @@ const InteractiveWhiteboardCanvas = forwardRef<
  * Whiteboard canvas with pan, zoom, auto-fit, and bounded viewport.
  */
 export type WhiteboardCanvasProps = {
+  whiteboard?: Whiteboard | null;
   onViewModifiedChange?: (modified: boolean) => void;
 };
 
 export const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCanvasProps>(
-  function WhiteboardCanvas({ onViewModifiedChange }, ref) {
+  function WhiteboardCanvas({ whiteboard, onViewModifiedChange }, ref) {
     const { t } = useI18n();
-    const stage = useStageStore.use.stage();
     const isClearing = useCanvasStore.use.whiteboardClearing();
     const containerRef = useRef<HTMLDivElement>(null);
     const [containerSize, setContainerSize] = useState({ width: 0, height: 0 });
 
-    const whiteboard = stage?.whiteboard?.[0];
     const rawElements = whiteboard?.elements;
     const elements = useMemo(() => rawElements ?? [], [rawElements]);
 
-    const canvasWidth = 1000;
-    const canvasHeight = 562.5;
+    const canvasWidth = whiteboard?.viewportSize ?? 1000;
+    // viewportRatio is height/width; normalize into the plausible band so an
+    // inverted persisted ratio (16:9 written as width/height) can never render
+    // a sheet taller than it is wide, even if it bypassed the runtime repair.
+    const canvasHeight =
+      canvasWidth * normalizeWhiteboardViewportRatio(whiteboard?.viewportRatio ?? 0.5625);
 
     const containerScale = useMemo(() => {
       if (containerSize.width === 0 || containerSize.height === 0) return 1;
@@ -425,7 +453,8 @@ export const WhiteboardCanvas = forwardRef<WhiteboardCanvasHandle, WhiteboardCan
     }, []);
 
     return (
-      <div ref={containerRef} className="w-full h-full overflow-hidden">
+      <div ref={containerRef} className="whiteboard-screen-canvas w-full h-full overflow-hidden">
+        <style dangerouslySetInnerHTML={{ __html: WHITEBOARD_SHAPE_PROSE_STYLES }} />
         <InteractiveWhiteboardCanvas
           ref={ref}
           canvasHeight={canvasHeight}

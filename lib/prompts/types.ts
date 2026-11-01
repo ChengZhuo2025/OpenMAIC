@@ -5,25 +5,7 @@
 /**
  * Prompt template identifier
  */
-export type PromptId =
-  | 'requirements-to-outlines'
-  | 'interactive-outlines'
-  | 'web-search-query-rewrite'
-  | 'slide-content'
-  | 'quiz-content'
-  | 'slide-actions'
-  | 'quiz-actions'
-  | 'interactive-actions'
-  | 'simulation-content'
-  | 'diagram-content'
-  | 'code-content'
-  | 'game-content'
-  | 'visualization3d-content'
-  | 'widget-teacher-actions'
-  | 'pbl-actions'
-  | 'agent-system'
-  | 'director'
-  | 'pbl-design';
+export type PromptId = 'interactive-outlines' | 'task-engine-outlines' | 'web-search-query-rewrite';
 
 /**
  * Snippet identifier
@@ -32,7 +14,12 @@ export type SnippetId =
   | 'json-output-rules'
   | 'element-types'
   | 'action-types'
-  | 'speech-guidelines';
+  | 'image-instructions'
+  | 'video-instructions'
+  | 'media-safety-guidelines'
+  | 'slide-image-instructions'
+  | 'slide-generated-image-instructions'
+  | 'slide-video-instructions';
 
 /**
  * Loaded prompt template
@@ -42,3 +29,5 @@ export interface LoadedPrompt {
   systemPrompt: string;
   userPromptTemplate: string;
 }
+
+export type PromptVariableDefaults = Partial<Record<PromptId, Readonly<Record<string, unknown>>>>;

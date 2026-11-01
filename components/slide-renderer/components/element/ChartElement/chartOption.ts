@@ -1,4 +1,5 @@
 import type { ComposeOption } from 'echarts/core';
+import type { GridComponentOption } from 'echarts/components';
 import type {
   BarSeriesOption,
   LineSeriesOption,
@@ -6,10 +7,15 @@ import type {
   ScatterSeriesOption,
   RadarSeriesOption,
 } from 'echarts/charts';
-import type { ChartData, ChartType } from '@/lib/types/slides';
+import type { ChartData, ChartType } from '@openmaic/dsl';
 
 type EChartOption = ComposeOption<
-  BarSeriesOption | LineSeriesOption | PieSeriesOption | ScatterSeriesOption | RadarSeriesOption
+  | BarSeriesOption
+  | LineSeriesOption
+  | PieSeriesOption
+  | ScatterSeriesOption
+  | RadarSeriesOption
+  | GridComponentOption
 >;
 
 export interface ChartOptionPayload {
@@ -45,11 +51,16 @@ export const getChartOption = ({
       }
     : undefined;
 
-  const axisLabel = textColor
-    ? {
-        color: textColor,
-      }
-    : undefined;
+  const axisLabel = {
+    show: true,
+    color: textColor ?? '#333333',
+  };
+
+  // Legacy containLabel does not include horizontal endpoint overhang.
+  const horizontalEndpointAlignment = {
+    alignMinLabel: 'left' as const,
+    alignMaxLabel: 'right' as const,
+  };
 
   const splitLine = lineColor
     ? {
@@ -59,6 +70,15 @@ export const getChartOption = ({
       }
     : {};
 
+  // Defensive check: ensure series is a non-empty array before processing
+  if (!Array.isArray(data?.series) || data.series.length === 0 || !Array.isArray(data.labels)) {
+    return null;
+  }
+  const categoryAxisLabel = {
+    ...axisLabel,
+    interval: data.labels.length <= 8 ? 0 : ('auto' as const),
+  };
+
   const legend =
     data.series.length > 1
       ? {
@@ -67,16 +87,30 @@ export const getChartOption = ({
         }
       : undefined;
 
+  const cartesianLegend = legend
+    ? { type: 'scroll' as const, bottom: 0, left: '4%', right: '4%', textStyle }
+    : undefined;
+  // Text headroom and a single legend row need fixed pixels, not a share of
+  // the chart height. Other margins reflow on resize; containLabel fits axes.
+  const grid: GridComponentOption = {
+    left: '4%',
+    right: '4%',
+    top: type === 'line' || type === 'area' ? 22 : '8%',
+    bottom: cartesianLegend && type !== 'scatter' ? 26 : '12%',
+    containLabel: true,
+  };
+
   if (type === 'bar') {
     return {
       color: themeColors,
       textStyle,
-      legend,
+      legend: cartesianLegend,
+      grid,
       xAxis: {
         type: 'category',
         data: data.labels,
         axisLine,
-        axisLabel,
+        axisLabel: categoryAxisLabel,
       },
       yAxis: {
         type: 'value',
@@ -105,17 +139,18 @@ export const getChartOption = ({
     return {
       color: themeColors,
       textStyle,
-      legend,
+      legend: cartesianLegend,
+      grid,
       yAxis: {
         type: 'category',
         data: data.labels,
         axisLine,
-        axisLabel,
+        axisLabel: categoryAxisLabel,
       },
       xAxis: {
         type: 'value',
         axisLine,
-        axisLabel,
+        axisLabel: { ...axisLabel, ...horizontalEndpointAlignment },
         splitLine,
       },
       series: data.series.map((item, index) => {
@@ -139,12 +174,13 @@ export const getChartOption = ({
     return {
       color: themeColors,
       textStyle,
-      legend,
+      legend: cartesianLegend,
+      grid,
       xAxis: {
         type: 'category',
         data: data.labels,
         axisLine,
-        axisLabel,
+        axisLabel: categoryAxisLabel,
       },
       yAxis: {
         type: 'value',
@@ -168,6 +204,8 @@ export const getChartOption = ({
     };
   }
   if (type === 'pie') {
+    const series0 = data.series[0];
+    if (!Array.isArray(series0)) return null;
     return {
       color: themeColors,
       textStyle,
@@ -177,7 +215,7 @@ export const getChartOption = ({
       },
       series: [
         {
-          data: data.series[0].map((item, index) => ({
+          data: series0.map((item, index) => ({
             value: item,
             name: data.labels[index],
           })),
@@ -205,6 +243,8 @@ export const getChartOption = ({
     };
   }
   if (type === 'ring') {
+    const series0 = data.series[0];
+    if (!Array.isArray(series0)) return null;
     return {
       color: themeColors,
       textStyle,
@@ -214,7 +254,7 @@ export const getChartOption = ({
       },
       series: [
         {
-          data: data.series[0].map((item, index) => ({
+          data: series0.map((item, index) => ({
             value: item,
             name: data.labels[index],
           })),
@@ -245,13 +285,14 @@ export const getChartOption = ({
     return {
       color: themeColors,
       textStyle,
-      legend,
+      legend: cartesianLegend,
+      grid,
       xAxis: {
         type: 'category',
         boundaryGap: false,
         data: data.labels,
         axisLine,
-        axisLabel,
+        axisLabel: { ...categoryAxisLabel, ...horizontalEndpointAlignment },
       },
       yAxis: {
         type: 'value',
@@ -261,7 +302,13 @@ export const getChartOption = ({
       },
       series: data.series.map((item, index) => {
         const seriesItem: LineSeriesOption = {
-          data: item,
+          // Area points sit on the plot edges; turn endpoint values inward.
+          data: item.map((value, dataIndex) => ({
+            value,
+            label: {
+              align: dataIndex === 0 ? 'left' : dataIndex === item.length - 1 ? 'right' : 'center',
+            },
+          })),
           name: data.legends[index],
           type: 'line',
           areaStyle: {},
@@ -309,19 +356,22 @@ export const getChartOption = ({
     };
   }
   if (type === 'scatter') {
+    const series0 = data.series[0];
+    if (!Array.isArray(series0)) return null;
     const formatedData = [];
-    for (let i = 0; i < data.series[0].length; i++) {
-      const x = data.series[0][i];
-      const y = data.series[1] ? data.series[1][i] : x;
+    for (let i = 0; i < series0.length; i++) {
+      const x = series0[i];
+      const y = data.series[1]?.[i] ?? x;
       formatedData.push([x, y]);
     }
 
     return {
       color: themeColors,
       textStyle,
+      grid,
       xAxis: {
         axisLine,
-        axisLabel,
+        axisLabel: { ...axisLabel, ...horizontalEndpointAlignment },
         splitLine,
       },
       yAxis: {

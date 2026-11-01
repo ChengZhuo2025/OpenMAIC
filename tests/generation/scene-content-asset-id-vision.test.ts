@@ -1,0 +1,585 @@
+import sharp from 'sharp';
+import { beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+
+import { createLogger } from '@/lib/logger';
+import type { SceneOutline } from '@/lib/types/generation';
+
+let png: Buffer;
+beforeAll(async () => {
+  png = await sharp({
+    create: { width: 32, height: 24, channels: 3, background: 'white' },
+  })
+    .png()
+    .toBuffer();
+});
+function imageBase64(label: string): string {
+  return Buffer.concat([png, Buffer.from(label)]).toString('base64');
+}
+
+const callLLMMock = vi.hoisted(() => vi.fn());
+const resolveModelMock = vi.hoisted(() => vi.fn());
+const resolveVisionImagesMock = vi.hoisted(() => vi.fn());
+
+vi.mock('@/lib/ai/llm', () => ({
+  callLLM: callLLMMock,
+}));
+
+/**
+ * Server-backed generation by allocated asset id (RFC #1153 part 2 B): the
+ * run passes `imageMapping` as (image id → allocated asset id), the step
+ * resolves those ids to bytes at prompt-assembly time (before
+ * `buildVisionUserContent`), and `resolveImageIds` writes the ALLOCATED ID
+ * into `PPTImageElement.src` for the renderer to resolve through the pool.
+ */
+describe('scene content step — asset-id image transport', () => {
+  beforeEach(() => {
+    callLLMMock.mockReset();
+    resolveModelMock.mockReset();
+    resolveVisionImagesMock.mockReset();
+    resolveModelMock.mockResolvedValue({
+      model: { provider: 'test.chat', modelId: 'test-model' },
+      modelInfo: { outputWindow: 4096, capabilities: { vision: true } },
+      modelString: 'test:test-model',
+      thinkingConfig: undefined,
+    });
+  });
+
+  test('resolves asset ids to the same bytes the base64 path would send and writes the allocated id into src', async () => {
+    vi.resetModules();
+    // The vision slice reaches the step with the allocated id as its src.
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images.map((image) => ({
+        ...image,
+        src: `data:image/png;base64,${imageBase64('resolved-bytes')}`,
+      })),
+    );
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          {
+            type: 'image',
+            src: 'img_1',
+            left: 100,
+            top: 100,
+            width: 400,
+            height: 300,
+            rotate: 0,
+          },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(),
+      pdfImages: [{ id: 'img_1', src: '', pageNumber: 1, width: 100, height: 100 }],
+      imageMapping: { img_1: 'ast_allocated_image_0001' },
+    });
+
+    // The prompt-assembly resolution was asked for the allocated id.
+    expect(resolveVisionImagesMock).toHaveBeenCalledWith(
+      [
+        {
+          id: 'img_1',
+          src: 'ast_allocated_image_0001',
+          width: 100,
+          height: 100,
+        },
+      ],
+      expect.anything(),
+    );
+    // The LLM received the resolved bytes (same content the base64 path would
+    // send — `buildVisionUserContent` strips the data-URL prefix).
+    const messages = callLLMMock.mock.calls[0][0].messages;
+    const imagePart = messages[0].content.find((part: { type: string }) => part.type === 'image');
+    expect(imagePart).toMatchObject({
+      type: 'image',
+      image: imageBase64('resolved-bytes'),
+      mimeType: 'image/png',
+    });
+    // The generated element's src is the ALLOCATED ID, resolved by the
+    // renderer through the pool registry.
+    expect(body.content.elements[0].src).toBe('ast_allocated_image_0001');
+  });
+
+  test('passes data URLs through untouched on a browser-backed request', async () => {
+    vi.resetModules();
+    const dataUrl = `data:image/png;base64,${imageBase64('browser-bytes')}`;
+    resolveVisionImagesMock.mockImplementation(
+      async (images: Array<{ id: string; src: string }>) => images,
+    );
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          {
+            type: 'image',
+            src: 'img_1',
+            left: 100,
+            top: 100,
+            width: 400,
+            height: 300,
+            rotate: 0,
+          },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(),
+      pdfImages: [{ id: 'img_1', src: dataUrl, pageNumber: 1, width: 100, height: 100 }],
+      imageMapping: { img_1: dataUrl },
+    });
+
+    // The data-URL payload reaches the resolver verbatim (pass-through), so
+    // the LLM content is byte-identical to the pre-part-2 path.
+    expect(resolveVisionImagesMock).toHaveBeenCalledWith(
+      [{ id: 'img_1', src: dataUrl, width: 100, height: 100 }],
+      expect.anything(),
+    );
+    expect(body.content.elements[0].src).toBe(dataUrl);
+  });
+
+  test('drops an undecodable image from the prompt, attachments, and asset-id mapping', async () => {
+    vi.resetModules();
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images.map((image) => ({
+        ...image,
+        src:
+          image.id === 'img_1'
+            ? `data:image/png;base64,${imageBase64('good')}`
+            : `data:image/bmp;base64,${Buffer.from('undecodable').toString('base64')}`,
+      })),
+    );
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          { type: 'image', src: 'img_2', left: 100, top: 100, width: 400, height: 300, rotate: 0 },
+        ],
+        remark: '',
+      }),
+    });
+    const body = await generate({
+      outline: slideOutline(['img_1', 'img_2']),
+      pdfImages: [
+        { id: 'img_1', src: '', pageNumber: 1 },
+        { id: 'img_2', src: '', pageNumber: 2 },
+      ],
+      imageMapping: { img_1: 'ast_good', img_2: 'ast_bad' },
+    });
+    const content = callLLMMock.mock.calls[0][0].messages[0].content;
+    expect(content[0].text).toContain('img_1');
+    expect(content[0].text).toContain('[see attached]');
+    expect(content[0].text).not.toContain('img_2');
+    expect(resolveVisionImagesMock).toHaveBeenCalledTimes(3);
+    expect(content.filter((part: { type: string }) => part.type === 'image')).toHaveLength(1);
+    expect(body.content.elements).toHaveLength(0);
+  });
+
+  test('drops an unresolvable image from BOTH the prompt text and the attachments (N3)', async () => {
+    vi.resetModules();
+    // The pre-resolution drops img_2 (the server cannot resolve its id);
+    // img_1 resolves to bytes, data URLs pass through.
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images
+        .filter((image) => image.src !== 'ast_gone')
+        .map((image) => ({
+          ...image,
+          src: image.src.startsWith('data:')
+            ? image.src
+            : `data:image/png;base64,${imageBase64(`bytes-for-${image.id}`)}`,
+        })),
+    );
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          {
+            type: 'image',
+            src: 'img_1',
+            left: 100,
+            top: 100,
+            width: 400,
+            height: 300,
+            rotate: 0,
+          },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(['img_1', 'img_2']),
+      pdfImages: [
+        { id: 'img_1', src: '', pageNumber: 1, width: 100, height: 100 },
+        { id: 'img_2', src: '', pageNumber: 2, width: 200, height: 100 },
+      ],
+      imageMapping: { img_1: 'ast_ok', img_2: 'ast_gone' },
+    });
+
+    // The prompt text promised `[see attached]` only for img_1 — img_2's
+    // text mention is gone with its attachment (no dangling promise).
+    const content = callLLMMock.mock.calls[0][0].messages[0].content;
+    const textPart = content.find((part: { type: string }) => part.type === 'text');
+    expect(textPart.text).toContain('img_1');
+    expect(textPart.text).toContain('[see attached]');
+    expect(textPart.text).not.toContain('img_2');
+    // Only img_1's bytes were attached.
+    const imageParts = content.filter((part: { type: string }) => part.type === 'image');
+    expect(imageParts).toHaveLength(1);
+    expect(imageParts[0].image).toBe(imageBase64('bytes-for-img_1'));
+    // The surviving image still resolves to the ALLOCATED ID in the element
+    // src (part 2 B transport preserved).
+    expect(body.content.elements[0].src).toBe('ast_ok');
+  });
+
+  test('handles a MIXED imageMapping (allocated ids AND data URLs) in one request (N4)', async () => {
+    vi.resetModules();
+    const dataUrl = `data:image/png;base64,${imageBase64('browser-bytes')}`;
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images.map((image) => ({
+        ...image,
+        src: image.src.startsWith('data:')
+          ? image.src
+          : `data:image/png;base64,${imageBase64('resolved-bytes')}`,
+      })),
+    );
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          {
+            type: 'image',
+            src: 'img_1',
+            left: 100,
+            top: 100,
+            width: 400,
+            height: 300,
+            rotate: 0,
+          },
+          {
+            type: 'image',
+            src: 'img_2',
+            left: 100,
+            top: 420,
+            width: 400,
+            height: 300,
+            rotate: 0,
+          },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(['img_1', 'img_2']),
+      pdfImages: [
+        { id: 'img_1', src: '', pageNumber: 1, width: 100, height: 100 },
+        { id: 'img_2', src: dataUrl, pageNumber: 2, width: 200, height: 100 },
+      ],
+      imageMapping: { img_1: 'ast_mixed_1', img_2: dataUrl },
+    });
+
+    // The LLM received both images (id resolved, data URL passed through).
+    const content = callLLMMock.mock.calls[0][0].messages[0].content;
+    const imageParts = content.filter((part: { type: string }) => part.type === 'image');
+    expect(imageParts).toHaveLength(2);
+    // resolveImageIds writes each mapping value verbatim: the allocated id
+    // stays an id, the data URL stays a data URL — the renderer resolves both.
+    expect(body.content.elements[0].src).toBe('ast_mixed_1');
+    expect(body.content.elements[1].src).toBe(dataUrl);
+  });
+
+  test('multi-drop: refills the vision slice with RESOLVED candidates so no promise dangles (P2)', async () => {
+    vi.resetModules();
+    const dataUrlFor = (bytes: string) => `data:image/png;base64,${imageBase64(bytes)}`;
+    // 25 candidates (> MAX_VISION_IMAGES = 20); img_2, img_7 and img_15 are
+    // unresolvable. The old N3 filter dropped them and let the generator
+    // re-slice img_21..img_23 in UNRESOLVED; the refill must admit them WITH
+    // their resolution — every `[see attached]` promise has an attachment.
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images
+        .filter((image) => image.src !== 'ast_gone')
+        .map((image) => ({ ...image, src: dataUrlFor(`bytes-for-${image.id}`) })),
+    );
+    const ids = Array.from({ length: 25 }, (_, i) => `img_${i + 1}`);
+    const gone = new Set(['img_2', 'img_7', 'img_15']);
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          { type: 'image', src: 'img_1', left: 100, top: 100, width: 400, height: 300, rotate: 0 },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(ids),
+      pdfImages: ids.map((id, index) => ({
+        id,
+        src: '',
+        pageNumber: index + 1,
+        width: 100,
+        height: 100,
+      })),
+      imageMapping: Object.fromEntries(
+        ids.map((id) => [id, gone.has(id) ? 'ast_gone' : `ast_${id}`]),
+      ),
+    });
+
+    const content = callLLMMock.mock.calls[0][0].messages[0].content;
+    const textPart = content.find((part: { type: string }) => part.type === 'text');
+    const text = textPart.text as string;
+    // The dropped ids are gone from the text entirely (no dangling mention).
+    // Word-boundary matched: `img_2` must not match inside the refilled
+    // `img_21`..`img_23`.
+    for (const id of gone) {
+      expect(text).not.toMatch(new RegExp(`\\b${id}\\b`));
+    }
+    // Exactly 20 `[see attached]` promises — one per attachment, no more.
+    expect(text.match(/\[see attached\]/g)).toHaveLength(20);
+    // Every attachment is the RESOLVED bytes of a surviving candidate, in
+    // generator order — including the REFILLED img_21..img_23 (which the old
+    // filter would have admitted unresolved).
+    const expectedResolved = ids.filter((id) => !gone.has(id)).slice(0, 20);
+    const imageParts = content.filter((part: { type: string }) => part.type === 'image');
+    expect(imageParts).toHaveLength(20);
+    imageParts.forEach((part: { image: string }, index: number) => {
+      expect(part.image).toBe(imageBase64(`bytes-for-${expectedResolved[index]}`));
+    });
+    for (const refilled of ['img_21', 'img_22', 'img_23']) {
+      expect(text).toContain(`**${refilled}**`);
+      expect(text).toContain('[see attached]');
+    }
+    // The surviving element still resolves to its ALLOCATED id (B transport).
+    expect(body.content.elements[0].src).toBe('ast_img_1');
+  });
+
+  test('all-unresolvable fast-fail: the consecutive-failure fuse stops probing after 3 and generation proceeds text-only (P2-r3)', async () => {
+    vi.resetModules();
+    // Every candidate unresolvable, INSTANTLY (a fast-failing store). Without
+    // a fuse the loop would churn through ALL 25 candidates sequentially (one
+    // probe + one warn each); the fuse must stop after 3 consecutive failures
+    // and degrade to text-only generation — never fail the request.
+    const { ids, pdfImages, imageMapping } = manyCandidateImages(25);
+    resolveVisionImagesMock.mockResolvedValue([]);
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({ elements: [], remark: '' }),
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await generate({ outline: slideOutline(ids), pdfImages, imageMapping });
+
+    // The fuse tripped after exactly 3 probes — the other 22 were never
+    // probed (no N-warn churn).
+    expect(resolveVisionImagesMock).toHaveBeenCalledTimes(3);
+    // Generation proceeded with an empty resolved set: text-only (the aiCall
+    // sees no vision images, so callLLM gets a plain `prompt`), no dangling
+    // `[see attached]` promise.
+    expect(callLLMMock).toHaveBeenCalledTimes(1);
+    const prompt = callLLMMock.mock.calls[0][0].prompt as string;
+    expect(prompt).not.toContain('[see attached]');
+    expect(callLLMMock.mock.calls[0][0].messages).toBeUndefined();
+    // ONE summary warn names the fuse (the per-candidate warns are collapsed).
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('consecutive-failure fuse');
+    warn.mockRestore();
+  });
+
+  test('undecodable but resolvable images do not trip the fuse; later valid images still refill the slice', async () => {
+    vi.resetModules();
+    // The store answers every probe, but the first four images are corrupt.
+    // Preparation drops them; that is a content problem, not a store outage,
+    // so the consecutive-failure fuse must not stop the phase before img_5.
+    const { ids, pdfImages, imageMapping } = manyCandidateImages(5);
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images.map((image) => ({
+        ...image,
+        src:
+          image.src === 'ast_img_5' || image.id === 'img_5'
+            ? `data:image/png;base64,${imageBase64('good')}`
+            : `data:image/bmp;base64,${Buffer.from('undecodable').toString('base64')}`,
+      })),
+    );
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({ elements: [], remark: '' }),
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    await generate({ outline: slideOutline(ids), pdfImages, imageMapping });
+
+    const content = callLLMMock.mock.calls[0][0].messages[0].content;
+    expect(content[0].text).toContain('img_5');
+    expect(content[0].text).not.toContain('**img_1**');
+    expect(content.filter((part: { type: string }) => part.type === 'image')).toHaveLength(1);
+    expect(warn.mock.calls.some((call) => String(call[0]).includes('fuse'))).toBe(false);
+    warn.mockRestore();
+  });
+
+  test('hanging store: the aggregate resolution budget stops the phase within the bound, no hang (P2-r3)', async () => {
+    vi.resetModules();
+    vi.useFakeTimers();
+    // The store accepts the probe but never answers — a stalled database with
+    // no statement timeout. Each probe would otherwise hold the step until
+    // the platform cap; the aggregate phase budget (the mocked 50 ms below,
+    // the shared 15 s constant in production) must stop the phase within the
+    // bound and degrade to text-only generation.
+    const { ids, pdfImages, imageMapping } = manyCandidateImages(25);
+    resolveVisionImagesMock.mockImplementation(() => new Promise(() => undefined));
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({ elements: [], remark: '' }),
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const pending = generate({ outline: slideOutline(ids), pdfImages, imageMapping });
+    await vi.advanceTimersByTimeAsync(15_000);
+    await pending;
+
+    // Only the FIRST candidate was probed before the budget fired.
+    expect(resolveVisionImagesMock).toHaveBeenCalledTimes(1);
+    expect(callLLMMock).toHaveBeenCalledTimes(1);
+    const prompt = callLLMMock.mock.calls[0][0].prompt as string;
+    expect(prompt).not.toContain('[see attached]');
+    expect(callLLMMock.mock.calls[0][0].messages).toBeUndefined();
+    // ONE summary warn names the budget.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('aggregate resolution budget');
+    warn.mockRestore();
+    vi.useRealTimers();
+  });
+
+  test('hallucinated reference to a DROPPED id removes the element (no dangling src, P3)', async () => {
+    vi.resetModules();
+    const dataUrlFor = (bytes: string) => `data:image/png;base64,${imageBase64(bytes)}`;
+    resolveVisionImagesMock.mockImplementation(async (images: Array<{ id: string; src: string }>) =>
+      images
+        .filter((image) => image.src !== 'ast_gone')
+        .map((image) => ({ ...image, src: dataUrlFor(`bytes-for-${image.id}`) })),
+    );
+    // The model hallucinates a reference to img_2, which the step dropped
+    // (its allocated id does not resolve server-side — a reclaimed asset).
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          { type: 'image', src: 'img_1', left: 100, top: 100, width: 400, height: 300, rotate: 0 },
+          { type: 'image', src: 'img_2', left: 100, top: 420, width: 400, height: 300, rotate: 0 },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(['img_1', 'img_2']),
+      pdfImages: [
+        { id: 'img_1', src: '', pageNumber: 1, width: 100, height: 100 },
+        { id: 'img_2', src: '', pageNumber: 2, width: 200, height: 100 },
+      ],
+      imageMapping: { img_1: 'ast_ok', img_2: 'ast_gone' },
+    });
+
+    // img_2 was STRIPPED from the mapping passed to the generator, so
+    // resolveImageIds takes the clean "no mapping → remove element" path
+    // instead of writing the dangling allocated id into src.
+    expect(body.content.elements).toHaveLength(1);
+    expect(body.content.elements[0].src).toBe('ast_ok');
+  });
+
+  test('browser-backed mode is unaffected: >cap data-URL images all keep their promises', async () => {
+    vi.resetModules();
+    const dataUrlFor = (bytes: string) => `data:image/png;base64,${imageBase64(bytes)}`;
+    // Data URLs pass through the resolver untouched — nothing can drop.
+    resolveVisionImagesMock.mockImplementation(
+      async (images: Array<{ id: string; src: string }>) => images,
+    );
+    const ids = Array.from({ length: 25 }, (_, i) => `img_${i + 1}`);
+    callLLMMock.mockResolvedValueOnce({
+      text: JSON.stringify({
+        elements: [
+          { type: 'image', src: 'img_1', left: 100, top: 100, width: 400, height: 300, rotate: 0 },
+        ],
+        remark: '',
+      }),
+    });
+
+    const body = await generate({
+      outline: slideOutline(ids),
+      pdfImages: ids.map((id, index) => ({
+        id,
+        src: '',
+        pageNumber: index + 1,
+        width: 100,
+        height: 100,
+      })),
+      imageMapping: Object.fromEntries(ids.map((id) => [id, dataUrlFor(id)])),
+    });
+
+    const content = callLLMMock.mock.calls[0][0].messages[0].content;
+    const textPart = content.find((part: { type: string }) => part.type === 'text');
+    // The same 20 + 5 split as before part 2: 20 attached, 5 plain text.
+    expect((textPart.text as string).match(/\[see attached\]/g)).toHaveLength(20);
+    const imageParts = content.filter((part: { type: string }) => part.type === 'image');
+    expect(imageParts).toHaveLength(20);
+    imageParts.forEach((part: { image: string }, index: number) => {
+      expect(part.image).toBe(imageBase64(ids[index]));
+    });
+    // The element src is the data URL verbatim, exactly as before.
+    expect(body.content.elements[0].src).toBe(dataUrlFor('img_1'));
+  });
+});
+
+/** Generate one scene's content as a run does, with the stubbed model and vision resolver. */
+async function generate(input: {
+  outline: SceneOutline;
+  pdfImages?: Array<{
+    id: string;
+    src: string;
+    pageNumber: number;
+    width?: number;
+    height?: number;
+  }>;
+  imageMapping?: Record<string, string>;
+}) {
+  const { generateSceneContent } = await import('@/lib/server/generation/steps/scene-content');
+  const result = await generateSceneContent(
+    {
+      outline: input.outline,
+      pdfImages: input.pdfImages ?? [],
+      imageMapping: input.imageMapping ?? {},
+      targetLanguage: '',
+      model: await resolveModelMock(),
+    },
+    {
+      log: createLogger('Scene Content'),
+      resolveVisionImages: (images) => resolveVisionImagesMock(images, {}),
+    },
+  );
+  // The assertions read the generated content as the JSON it is.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return result as { content: any; effectiveOutline: any };
+}
+
+function slideOutline(suggestedImageIds: string[] = ['img_1']): SceneOutline {
+  return {
+    id: 'scene-slide',
+    type: 'slide',
+    title: 'Safety Checklist',
+    description: 'Inspect the device before calibration.',
+    keyPoints: ['Inspect', 'Calibrate'],
+    order: 1,
+    suggestedImageIds,
+  };
+}
+
+/** `count` assigned images with distinct allocated ids and page numbers. */
+function manyCandidateImages(count: number) {
+  const ids = Array.from({ length: count }, (_, i) => `img_${i + 1}`);
+  return {
+    ids,
+    pdfImages: ids.map((id, index) => ({
+      id,
+      src: '',
+      pageNumber: index + 1,
+      width: 100,
+      height: 100,
+    })),
+    imageMapping: Object.fromEntries(ids.map((id) => [id, `ast_${id}`])),
+  };
+}

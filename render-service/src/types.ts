@@ -1,0 +1,223 @@
+/**
+ * Shared types for the render service.
+ *
+ * The public shape a client sees when polling a job. Deliberately decoupled
+ * from `@hyperframes/producer`'s internal `RenderJob` so the HTTP contract
+ * (and therefore the app) stays stable if the producer's internals change.
+ */
+import type {
+  CapturePolicy,
+  RequestedCaptureMode,
+  ResourceProfileName,
+} from './resource-profile.js';
+
+/** Lifecycle of a render job as the app observes it. */
+export type RenderJobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+declare const renderOwnerIdBrand: unique symbol;
+declare const admissionIdentityBrand: unique symbol;
+
+/** Durable authorization identity asserted by the trusted app proxy. */
+export type RenderOwnerId = string & { readonly [renderOwnerIdBrand]: 'RenderOwnerId' };
+
+/** Network-derived bucket used only for admission control. */
+export type AdmissionIdentity = string & {
+  readonly [admissionIdentityBrand]: 'AdmissionIdentity';
+};
+
+const INTERNAL_IDENTITY_PATTERN = /^[\x21-\x7e]{1,256}$/;
+
+/** Parse the app's durable owner assertion at the HTTP boundary. */
+export function isRenderOwnerId(value: unknown): value is RenderOwnerId {
+  return typeof value === 'string' && INTERNAL_IDENTITY_PATTERN.test(value);
+}
+
+/** Parse the app's admission bucket assertion at the HTTP boundary. */
+export function isAdmissionIdentity(value: unknown): value is AdmissionIdentity {
+  return typeof value === 'string' && INTERNAL_IDENTITY_PATTERN.test(value);
+}
+
+/** Construct a durable render owner for trusted internal callers and tests. */
+export function requireRenderOwnerId(value: unknown): RenderOwnerId {
+  if (!isRenderOwnerId(value)) throw new TypeError('Invalid render owner identity');
+  return value;
+}
+
+/** Construct an admission identity for trusted internal callers and tests. */
+export function requireAdmissionIdentity(value: unknown): AdmissionIdentity {
+  if (!isAdmissionIdentity(value)) throw new TypeError('Invalid render admission identity');
+  return value;
+}
+
+/** User-facing render options accepted by `POST /owner-bound/render`. */
+export interface RenderOptions {
+  /** Integer frames per second. */
+  fps: number;
+  quality: 'draft' | 'standard' | 'high';
+  /** Only mp4 is supported in this phase; kept explicit for forward-compat. */
+  format: 'mp4';
+}
+
+export interface RuntimeVersions {
+  service: string;
+  producer: string;
+  node: string;
+  chromium: string;
+  chromiumPath: string;
+  ffmpeg: string;
+  ffmpegPath: string;
+  containerImage: string | null;
+}
+
+export interface RenderExecutionMetrics {
+  resourceProfile: ResourceProfileName;
+  capturePolicy: CapturePolicy;
+  requestedCaptureMode: RequestedCaptureMode;
+  actualCaptureMode: string;
+  requestedWorkers: number;
+  actualWorkers: number | null;
+  versions: RuntimeVersions;
+}
+
+/** Progress emitted by any render executor, normalized for service callers. */
+export interface RenderProgress {
+  /** Fraction complete in the stable 0..1 service range. */
+  progress: number;
+  stage: string;
+  framesRendered?: number;
+  totalFrames?: number;
+}
+
+/** Executor-independent performance data retained for diagnostics and benchmarks. */
+export interface RenderPerformanceSummary {
+  totalElapsedMs: number;
+  stages: Record<string, number>;
+  workers: number;
+  totalFrames: number;
+  captureMode?: string;
+  peakRssMb?: number;
+  tmpPeakBytes?: number;
+}
+
+/** Stable failure classification produced at the RenderExecutor seam. */
+export type RenderFailureCode =
+  | 'cancelled'
+  | 'deadline_exceeded'
+  | 'unsupported_capture_mode'
+  | 'execution_failed';
+
+export interface RenderCancelledFailure {
+  code: 'cancelled';
+  message: string;
+}
+
+export interface RenderFailedFailure {
+  code: Exclude<RenderFailureCode, 'cancelled'>;
+  message: string;
+}
+
+export type RenderFailure = RenderCancelledFailure | RenderFailedFailure;
+
+/** Everything an executor needs to run one render without knowing about HTTP jobs. */
+export interface RenderExecutionRequest {
+  projectDir: string;
+  outputPath: string;
+  options: RenderOptions;
+  /** User or coordinator cancellation. */
+  signal: AbortSignal;
+  /** Wall-clock budget starting when execution begins. */
+  deadlineMs: number;
+  onProgress: (progress: RenderProgress) => void | Promise<void>;
+  /** Optional bounded local chunk execution requested by an internal caller. */
+  chunkExecution?: {
+    chunkCount?: number;
+    chunkWorkers?: number;
+    maxParallelChunks?: number;
+    chunkSizeFrames?: number;
+    targetChunkFrames?: number;
+    planDir?: string;
+  };
+}
+
+/** Resource-owner settlement. A service slot is not the resource reservation. */
+export type RenderResourceDiagnosticCode =
+  | 'main_pid_fields_not_ready'
+  | 'main_pid_startup_transient'
+  | 'main_pid_process_exited'
+  | 'main_pid_read_error'
+  | 'main_pid_identity_mismatch';
+
+export interface RenderResourceSettlement {
+  published: boolean | 'unknown';
+  cleanupVerified: boolean;
+  reservationReturned: boolean;
+  admissionClosed: boolean;
+  /** Bounded, path-free summary safe to expose over HTTP. */
+  diagnosticCode?: RenderResourceDiagnosticCode;
+  /** Exact JSON-safe owner cleanup/publication evidence, retained on failure too. */
+  details: Record<string, unknown>;
+}
+
+export type RenderExecutionResult =
+  | {
+      status: 'succeeded';
+      performance?: RenderPerformanceSummary;
+      metrics?: RenderExecutionMetrics;
+      resources?: RenderResourceSettlement;
+    }
+  | {
+      status: 'cancelled';
+      failure: RenderCancelledFailure;
+      performance?: RenderPerformanceSummary;
+      metrics?: RenderExecutionMetrics;
+      resources?: RenderResourceSettlement;
+    }
+  | {
+      status: 'failed';
+      failure: RenderFailedFailure;
+      performance?: RenderPerformanceSummary;
+      metrics?: RenderExecutionMetrics;
+      resources?: RenderResourceSettlement;
+    };
+
+/**
+ * A render job's observable state. `progress` is normalized to 0..1; the HTTP
+ * layer surfaces it as-is and the client scales it to a percent.
+ */
+export interface RenderJobRecord {
+  readonly id: string;
+  /** Immutable authorization identity. Never included in the public job projection. */
+  readonly ownerId: RenderOwnerId;
+  /** Immutable admission bucket, deliberately separate from authorization. */
+  readonly admissionIdentity: AdmissionIdentity;
+  status: RenderJobStatus;
+  progress: number;
+  currentStage: string;
+  framesRendered?: number;
+  totalFrames?: number;
+  metrics?: RenderExecutionMetrics;
+  error?: string;
+  readonly createdAtMs: number;
+  updatedAtMs: number;
+  /** Absolute path to the unzipped project dir (for cleanup). */
+  readonly projectDir: string;
+  /** Absolute path to the rendered MP4 once `succeeded`. */
+  outputPath?: string;
+  /** Domain failure retained independently from the HTTP-compatible error string. */
+  failure?: RenderFailure;
+  /** Executor-independent diagnostics for completed or failed attempts. */
+  performance?: RenderPerformanceSummary;
+  resources?: RenderResourceSettlement;
+}
+
+/** Mutable fields accepted by JobStore.update; identity and storage keys cannot be patched. */
+export type RenderJobPatch = Partial<
+  Omit<
+    RenderJobRecord,
+    'id' | 'ownerId' | 'admissionIdentity' | 'createdAtMs' | 'updatedAtMs' | 'projectDir'
+  >
+>;
+
+export function isTerminal(status: RenderJobStatus): boolean {
+  return status === 'succeeded' || status === 'failed' || status === 'cancelled';
+}

@@ -4,12 +4,17 @@ import { useEffect, useState } from 'react';
 import { ScreenElement } from '@/components/slide-renderer/Editor/ScreenElement';
 import { SceneProvider } from '@/lib/contexts/scene-context';
 import { useStageStore } from '@/lib/store/stage';
-import type { PPTElement } from '@/lib/types/slides';
+import type { PPTElement } from '@openmaic/dsl';
+import { createTextProseStyles } from '@openmaic/renderer';
+
+const EVAL_SHAPE_PROSE_STYLES = createTextProseStyles(
+  '.eval-whiteboard-canvas .screen-element .slide-renderer-prose',
+);
 
 const EVAL_STAGE_ID = '__eval_stage__';
 const EVAL_SCENE_ID = '__eval_scene__';
 const CANVAS_WIDTH = 1000;
-const CANVAS_HEIGHT = 562.5;
+const CANVAS_HEIGHT = 563;
 
 function WhiteboardCanvas() {
   const [elements, setElements] = useState<PPTElement[]>([]);
@@ -86,6 +91,7 @@ function WhiteboardCanvas() {
   return (
     <SceneProvider>
       <div
+        className="eval-whiteboard-canvas"
         style={{
           position: 'relative',
           width: CANVAS_WIDTH,
@@ -94,6 +100,7 @@ function WhiteboardCanvas() {
           overflow: 'hidden',
         }}
       >
+        <style dangerouslySetInnerHTML={{ __html: EVAL_SHAPE_PROSE_STYLES }} />
         {elements.map((element, index) => (
           <ScreenElement key={element.id} elementInfo={element} elementIndex={index} />
         ))}

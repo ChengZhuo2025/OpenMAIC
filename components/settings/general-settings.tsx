@@ -4,6 +4,7 @@ import { useState, useCallback } from 'react';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
+import { UsageDashboard } from './usage-dashboard';
 import {
   AlertDialog,
   AlertDialogContent,
@@ -15,11 +16,39 @@ import {
 } from '@/components/ui/alert-dialog';
 import { Loader2, Trash2, AlertTriangle } from 'lucide-react';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import { clearDatabase } from '@/lib/utils/database';
+import {
+  clearLocalCache,
+  clearLocalStorageKeepingImportState,
+} from '@/lib/device-storage/clear-local-cache';
+import { useSettingsStore } from '@/lib/store/settings';
+import { useUserProfileStore } from '@/lib/store/user-profile';
 import { toast } from 'sonner';
 import { createLogger } from '@/lib/logger';
+import { runClearCache } from './clear-cache-workflow';
 
 const log = createLogger('GeneralSettings');
+
+/**
+ * The shape of a zustand `persist` API this file needs. Declared structurally
+ * so one helper covers both stores without importing either state type.
+ */
+interface PersistApi {
+  getOptions: () => {
+    name?: string;
+    storage?: { removeItem: (name: string) => unknown };
+  };
+}
+
+/**
+ * Clear a store that persists through the KVStore.
+ *
+ * Not `persist.clearStorage()`: that discards the promise our KV-backed storage
+ * returns, and clearing has to be awaited before the reload below.
+ */
+async function clearPersistedStore(persistApi: PersistApi, fallbackName: string): Promise<void> {
+  const { storage, name } = persistApi.getOptions();
+  await storage?.removeItem(name ?? fallbackName);
+}
 
 export function GeneralSettings() {
   const { t } = useI18n();
@@ -36,19 +65,28 @@ export function GeneralSettings() {
     if (!isConfirmValid) return;
     setClearing(true);
     try {
-      // 1. Clear IndexedDB
-      await clearDatabase();
-      // 2. Clear localStorage
-      localStorage.clear();
-      // 3. Clear sessionStorage
-      sessionStorage.clear();
-
+      await runClearCache({
+        clearLocalCache,
+        clearLocalStorage: () => clearLocalStorageKeepingImportState(),
+        clearSessionStorage: () => sessionStorage.clear(),
+        clearPersistedStores: async () => {
+          // The blanket clear only reaches these stores while their KV backend
+          // happens to use localStorage. Account-scoped storage needs explicit cleanup.
+          await Promise.all([
+            clearPersistedStore(useSettingsStore.persist, 'settings-storage'),
+            clearPersistedStore(useUserProfileStore.persist, 'user-profile-storage'),
+          ]);
+        },
+      });
       toast.success(t('settings.clearCacheSuccess'));
 
-      // Reload page after a short delay
-      setTimeout(() => {
-        window.location.reload();
-      }, 1000);
+      // Reload without waiting. The stores are still live in memory, so the
+      // longer this page stays up the more chances a `set()` has to persist
+      // something after the clear. The seam refuses writes for the duration of
+      // a clear, which covers writes issued while the deletes are in flight,
+      // but not ones issued after they complete — hence keeping the window
+      // short as well.
+      window.location.reload();
     } catch (error) {
       log.error('Failed to clear cache:', error);
       toast.error(t('settings.clearCacheFailed'));
@@ -63,6 +101,9 @@ export function GeneralSettings() {
 
   return (
     <div className="flex flex-col gap-8">
+      {/* Usage statistics dashboard */}
+      <UsageDashboard />
+
       {/* Danger Zone - Clear Cache */}
       <div className="relative rounded-xl border border-destructive/30 bg-destructive/[0.03] dark:bg-destructive/[0.06] overflow-hidden">
         {/* Subtle diagonal stripe pattern for danger emphasis */}

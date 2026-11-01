@@ -1,0 +1,212 @@
+/**
+ * Keep-alive pool for interactive scene iframes (#619).
+ *
+ * Interactive scenes render their content in an `<iframe>`. When that element
+ * unmounts or is re-parented (Pro mode toggle, scene switch and back, any
+ * PlaybackChromeRoot remount) the browser drops the document and re-parses /
+ * re-runs from scratch, losing in-iframe state. To avoid that, the actual
+ * iframe elements live in a single stable host (`InteractiveIframeHost`)
+ * mounted at the `Stage` root, outside the reconciled scene subtree. This store
+ * is the coordination layer between the in-tree placeholder (`InteractiveRenderer`)
+ * and that host: it tracks, per scene, the content to render, the live on-screen
+ * rect to position the iframe over, and whether it should currently be visible.
+ *
+ * Entries are keyed by sceneId and persist across scene/mode changes — a scene's
+ * iframe is only rebuilt when its content actually changes. A small LRU cap
+ * bounds how many documents stay resident in memory.
+ */
+
+import type { ObservationIdentity } from '@/lib/interactive/observation-bridge';
+import {
+  OBSERVATION_SCOPE_ID,
+  supportsInteractiveObservation,
+} from '@/lib/interactive/observation';
+import { patchHtmlForIframe } from '@/lib/utils/iframe';
+import { create } from 'zustand';
+
+export const IFRAME_POOL_CAP = 3;
+
+export interface IframeRect {
+  readonly left: number;
+  readonly top: number;
+  readonly width: number;
+  readonly height: number;
+}
+
+export interface IframePoolEntry {
+  /** Patched HTML for `srcDoc`, when the scene carries inline HTML. */
+  readonly srcDoc?: string;
+  /**
+   * Identity of the observation reader baked into `srcDoc`. Minted here, with the
+   * entry, because the entry is the document's lifetime: a placeholder remount
+   * must reuse this document, and an identity minted per React instance would
+   * produce a new `srcDoc` string, miss the keep-alive path below, and reload the
+   * iframe — resetting whatever the student had set.
+   */
+  readonly observationIdentity?: ObservationIdentity;
+  /** Original source identity for send-time observation; never a state cache. */
+  readonly sourceHtml?: string;
+  /** URL for `src`, when the scene points at an external page. */
+  readonly src?: string;
+  /** Full available slot rect. The host contain-fits one fixed logical viewport inside it. */
+  readonly rect: IframeRect | null;
+  /** Visible intersection of the slot with overflow ancestors. The host clips to this. */
+  readonly clip: IframeRect | null;
+  /**
+   * Id of the placeholder instance that currently owns visibility, or null when
+   * no placeholder is mounted. The iframe shows iff this is non-null. Ownership
+   * (rather than a bare boolean) is what makes `release` race-safe: during the
+   * Stage mode cross-fade an outgoing placeholder's unmount cleanup can run
+   * *after* a newer placeholder for the same scene has already mounted and
+   * claimed it — keying the release on the owner id lets the stale cleanup
+   * no-op instead of hiding the live iframe.
+   */
+  readonly owner: string | null;
+  /** Monotonic recency marker for LRU eviction. */
+  readonly tick: number;
+}
+
+interface MountInput {
+  /** Authored HTML. The entry owns patching, so callers pass the source itself. */
+  readonly sourceHtml?: string;
+  readonly src?: string;
+}
+
+interface InteractiveIframePoolState {
+  entries: Record<string, IframePoolEntry>;
+  activeSceneId: string | null;
+  /** Monotonic counter; each mount/touch takes the next value. */
+  tick: number;
+  mount: (sceneId: string, input: MountInput) => void;
+  setRect: (sceneId: string, rect: IframeRect, clip?: IframeRect) => void;
+  /** A placeholder claims visibility for its scene, recording its owner id. */
+  claim: (sceneId: string, owner: string) => void;
+  /** Release visibility, but only if `owner` still owns it (stale = no-op). */
+  release: (sceneId: string, owner: string) => void;
+  setActive: (sceneId: string) => void;
+  evict: (sceneId: string) => void;
+  /** Drop everything (e.g. when the host unmounts on classroom switch). */
+  reset: () => void;
+}
+
+/**
+ * Drop the least-recently-touched entries until at most CAP remain. The active
+ * scene is never evicted (its iframe is on screen). Returns a new entries map.
+ */
+function evictLru(
+  entries: Record<string, IframePoolEntry>,
+  activeSceneId: string | null,
+): Record<string, IframePoolEntry> {
+  const ids = Object.keys(entries);
+  if (ids.length <= IFRAME_POOL_CAP) return entries;
+  const evictable = ids
+    .filter((id) => id !== activeSceneId)
+    .sort((a, b) => entries[a].tick - entries[b].tick);
+  const next = { ...entries };
+  let overflow = ids.length - IFRAME_POOL_CAP;
+  for (const id of evictable) {
+    if (overflow <= 0) break;
+    delete next[id];
+    overflow--;
+  }
+  return next;
+}
+
+export const useInteractiveIframePool = create<InteractiveIframePoolState>((set) => ({
+  entries: {},
+  activeSceneId: null,
+  tick: 0,
+
+  mount: (sceneId, input) =>
+    set((state) => {
+      const tick = state.tick + 1;
+      const existing = state.entries[sceneId];
+      // Same content already loaded: just refresh recency. Crucially we keep the
+      // existing entry — its srcDoc, and the reader identity baked into it — so
+      // the host never re-sets srcDoc (which would reload the iframe). Matching on
+      // the authored source, not on the prepared document, is what makes a
+      // placeholder remount with identical content hit this keep-alive path.
+      if (existing && existing.src === input.src && existing.sourceHtml === input.sourceHtml) {
+        const entries = { ...state.entries, [sceneId]: { ...existing, tick } };
+        return { entries, tick };
+      }
+      // New scene, or content changed: (re)build the entry. A content change here
+      // is the one intended reload path.
+      // One document preparation step, at the one moment a document is born.
+      const observationIdentity =
+        input.sourceHtml && supportsInteractiveObservation()
+          ? { sceneId, scopeId: OBSERVATION_SCOPE_ID, documentId: crypto.randomUUID() }
+          : undefined;
+      const entry: IframePoolEntry = {
+        srcDoc: input.sourceHtml
+          ? patchHtmlForIframe(input.sourceHtml, observationIdentity, {
+              mediaId:
+                globalThis.crypto?.randomUUID?.() ??
+                `media-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+            })
+          : undefined,
+        observationIdentity,
+        sourceHtml: input.sourceHtml,
+        src: input.src,
+        rect: existing?.rect ?? null,
+        clip: existing?.clip ?? null,
+        owner: existing?.owner ?? null,
+        tick,
+      };
+      const entries = evictLru({ ...state.entries, [sceneId]: entry }, state.activeSceneId);
+      return { entries, tick };
+    }),
+
+  setRect: (sceneId, rect, clip = rect) =>
+    set((state) => {
+      const existing = state.entries[sceneId];
+      if (!existing) return {};
+      const r = existing.rect;
+      const c = existing.clip;
+      if (
+        r &&
+        c &&
+        r.left === rect.left &&
+        r.top === rect.top &&
+        r.width === rect.width &&
+        r.height === rect.height &&
+        c.left === clip.left &&
+        c.top === clip.top &&
+        c.width === clip.width &&
+        c.height === clip.height
+      ) {
+        return {};
+      }
+      return { entries: { ...state.entries, [sceneId]: { ...existing, rect, clip } } };
+    }),
+
+  claim: (sceneId, owner) =>
+    set((state) => {
+      const existing = state.entries[sceneId];
+      if (!existing || existing.owner === owner) return {};
+      return { entries: { ...state.entries, [sceneId]: { ...existing, owner } } };
+    }),
+
+  release: (sceneId, owner) =>
+    set((state) => {
+      const existing = state.entries[sceneId];
+      // Only the current owner may release. A stale placeholder (whose unmount
+      // cleanup runs after a newer one already re-claimed during the mode
+      // cross-fade) finds owner !== its id and no-ops, so the live iframe stays.
+      if (!existing || existing.owner !== owner) return {};
+      return { entries: { ...state.entries, [sceneId]: { ...existing, owner: null } } };
+    }),
+
+  setActive: (sceneId) => set({ activeSceneId: sceneId }),
+
+  evict: (sceneId) =>
+    set((state) => {
+      if (!state.entries[sceneId]) return {};
+      const entries = { ...state.entries };
+      delete entries[sceneId];
+      const activeSceneId = state.activeSceneId === sceneId ? null : state.activeSceneId;
+      return { entries, activeSceneId };
+    }),
+
+  reset: () => set({ entries: {}, activeSceneId: null, tick: 0 }),
+}));

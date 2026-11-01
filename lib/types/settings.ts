@@ -1,49 +1,20 @@
-import type { ProviderId, ModelInfo, ProviderType } from '@/lib/types/provider';
-
+/**
+ * Sections of the settings dialog. Token Plan, Model Services and Course
+ * Model show the workspace's model configuration, which lives on the server;
+ * Skills and General are the user's own. The Model Services tabs keep their
+ * own values (`providers`, `image`, ...) so an opener can go straight to one.
+ */
 export type SettingsSection =
   | 'general'
+  | 'token-plan'
   | 'providers'
-  | 'agents'
   | 'tts'
   | 'asr'
   | 'pdf'
   | 'image'
   | 'video'
-  | 'web-search';
-
-/**
- * Unified provider configuration stored in JSON format
- * Stores all provider-specific settings and metadata in one object
- * Both built-in and custom providers use the same structure
- */
-export interface ProviderSettings {
-  // Configuration
-  apiKey: string;
-  baseUrl: string;
-  models: ModelInfo[]; // All models (user can edit/delete any)
-
-  // Metadata (same for built-in and custom providers)
-  name: string;
-  type: ProviderType;
-  defaultBaseUrl?: string;
-  icon?: string;
-  requiresApiKey: boolean;
-  isBuiltIn: boolean; // true for built-in providers, false for custom
-
-  // Server-side configuration (set by fetchServerProviders)
-  isServerConfigured?: boolean; // Server has API key for this provider
-  serverModels?: string[]; // Server-restricted model list (if set)
-  serverBaseUrl?: string; // Server-provided base URL override
-}
-
-/**
- * Provider configurations storage format
- * Key: providerId, Value: ProviderSettings
- */
-export type ProvidersConfig = Record<ProviderId, ProviderSettings>;
-
-export interface EditingModel {
-  providerId: ProviderId;
-  modelIndex: number | null; // null for new model
-  model: ModelInfo;
-}
+  | 'web-fetch'
+  | 'web-search'
+  | 'skills'
+  | 'course-models'
+  | 'model-services';

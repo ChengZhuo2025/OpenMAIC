@@ -1,10 +1,17 @@
 import { useCallback } from 'react';
 import { useCanvasStore, useKeyboardStore } from '@/lib/store';
 import { useHistorySnapshot } from '@/lib/hooks/use-history-snapshot';
-import type { PPTElement } from '@/lib/types/slides';
+import type { PPTElement } from '@openmaic/dsl';
 import type { AlignmentLineProps } from '@/lib/types/edit';
-import { getRectRotatedRange, uniqAlignLines, type AlignLine } from '@/lib/utils/element';
+import {
+  getElementRange,
+  getElementListRange,
+  uniqAlignLines,
+  type AlignLine,
+} from '@/lib/utils/element';
 import { useCanvasOperations } from '@/lib/hooks/use-canvas-operations';
+import { isTouchEvent } from './touch-event';
+import { projectInteractionElement, projectInteractionElements } from '../interaction-elements';
 
 /**
  * Drag element hook
@@ -32,10 +39,12 @@ export function useDragElement(
   const dragElement = useCallback(
     (e: React.MouseEvent | React.TouchEvent, element: PPTElement) => {
       const native = e.nativeEvent;
-      const isTouchEvent = native instanceof TouchEvent;
-      if (isTouchEvent && !native.changedTouches?.length) return;
+      const isTouch = isTouchEvent(native);
+      if (isTouch && !native.changedTouches?.length) return;
 
       if (!activeElementIdList.includes(element.id)) return;
+      const interactionElement = projectInteractionElement(element);
+      if (!interactionElement) return;
 
       let isMouseDown = true;
       const edgeWidth = viewportSize;
@@ -44,23 +53,26 @@ export function useDragElement(
       const sorptionRange = 5;
 
       // Save original element list for computing multi-select offsets
-      const originElementList: PPTElement[] = JSON.parse(JSON.stringify(elementListRef.current));
-      const originActiveElementList = originElementList.filter((el) =>
+      const originElementList = structuredClone(elementListRef.current);
+      const interactionElements = projectInteractionElements(originElementList);
+      const interactionById = new Map(interactionElements.map((item) => [item.id, item]));
+      const originActiveElementList = interactionElements.filter((el) =>
         activeElementIdList.includes(el.id),
       );
 
-      const elOriginLeft = element.left;
-      const elOriginTop = element.top;
-      const elOriginWidth = element.width;
-      const elOriginHeight = 'height' in element && element.height ? element.height : 0;
-      const elOriginRotate = 'rotate' in element && element.rotate ? element.rotate : 0;
+      const elOriginLeft = interactionElement.left;
+      const elOriginTop = interactionElement.top;
 
-      const startPageX = isTouchEvent ? native.changedTouches[0].pageX : native.pageX;
-      const startPageY = isTouchEvent ? native.changedTouches[0].pageY : native.pageY;
+      const startPageX = isTouch ? native.changedTouches[0].pageX : native.pageX;
+      const startPageY = isTouch ? native.changedTouches[0].pageY : native.pageY;
 
       let isMisoperation: boolean | null = null;
 
       const isActiveGroupElement = element.id === activeGroupElementId;
+      const originRange =
+        activeElementIdList.length === 1 || isActiveGroupElement
+          ? getElementRange(interactionElement)
+          : getElementListRange(originActiveElementList);
 
       // Collect alignment snap lines
       // Includes snap positions of other elements on canvas (excluding the target): top/bottom/left/right edges, horizontal/vertical centers
@@ -68,33 +80,15 @@ export function useDragElement(
       let horizontalLines: AlignLine[] = [];
       let verticalLines: AlignLine[] = [];
 
-      for (const el of elementListRef.current) {
+      for (const el of interactionElements) {
         if (el.type === 'line') continue;
         if (isActiveGroupElement && el.id === element.id) continue;
         if (!isActiveGroupElement && activeElementIdList.includes(el.id)) continue;
 
-        let left, top, width, height;
-        if ('rotate' in el && el.rotate) {
-          const { xRange, yRange } = getRectRotatedRange({
-            left: el.left,
-            top: el.top,
-            width: el.width,
-            height: el.height,
-            rotate: el.rotate,
-          });
-          left = xRange[0];
-          top = yRange[0];
-          width = xRange[1] - xRange[0];
-          height = yRange[1] - yRange[0];
-        } else {
-          left = el.left;
-          top = el.top;
-          width = el.width;
-          height = el.height;
-        }
+        const { minX: left, minY: top, maxX: right, maxY: bottom } = getElementRange(el);
+        const width = right - left;
+        const height = bottom - top;
 
-        const right = left + width;
-        const bottom = top + height;
         const centerX = top + height / 2;
         const centerY = left + width / 2;
 
@@ -168,78 +162,11 @@ export function useDragElement(
         let targetLeft = elOriginLeft + moveX;
         let targetTop = elOriginTop + moveY;
 
-        // Calculate target element's bounding range on canvas for alignment snapping
-        // Must distinguish single-select vs multi-select; single-select further distinguishes line, normal, and rotated elements
-        let targetMinX: number, targetMaxX: number, targetMinY: number, targetMaxY: number;
-
-        if (activeElementIdList.length === 1 || isActiveGroupElement) {
-          if (elOriginRotate) {
-            const { xRange, yRange } = getRectRotatedRange({
-              left: targetLeft,
-              top: targetTop,
-              width: elOriginWidth,
-              height: elOriginHeight,
-              rotate: elOriginRotate,
-            });
-            targetMinX = xRange[0];
-            targetMaxX = xRange[1];
-            targetMinY = yRange[0];
-            targetMaxY = yRange[1];
-          } else if (element.type === 'line') {
-            targetMinX = targetLeft;
-            targetMaxX = targetLeft + Math.max(element.start[0], element.end[0]);
-            targetMinY = targetTop;
-            targetMaxY = targetTop + Math.max(element.start[1], element.end[1]);
-          } else {
-            targetMinX = targetLeft;
-            targetMaxX = targetLeft + elOriginWidth;
-            targetMinY = targetTop;
-            targetMaxY = targetTop + elOriginHeight;
-          }
-        } else {
-          const leftValues = [];
-          const topValues = [];
-          const rightValues = [];
-          const bottomValues = [];
-
-          for (let i = 0; i < originActiveElementList.length; i++) {
-            const element = originActiveElementList[i];
-            const left = element.left + moveX;
-            const top = element.top + moveY;
-            const width = element.width;
-            const height = 'height' in element && element.height ? element.height : 0;
-            const rotate = 'rotate' in element && element.rotate ? element.rotate : 0;
-
-            if ('rotate' in element && element.rotate) {
-              const { xRange, yRange } = getRectRotatedRange({
-                left,
-                top,
-                width,
-                height,
-                rotate,
-              });
-              leftValues.push(xRange[0]);
-              topValues.push(yRange[0]);
-              rightValues.push(xRange[1]);
-              bottomValues.push(yRange[1]);
-            } else if (element.type === 'line') {
-              leftValues.push(left);
-              topValues.push(top);
-              rightValues.push(left + Math.max(element.start[0], element.end[0]));
-              bottomValues.push(top + Math.max(element.start[1], element.end[1]));
-            } else {
-              leftValues.push(left);
-              topValues.push(top);
-              rightValues.push(left + width);
-              bottomValues.push(top + height);
-            }
-          }
-
-          targetMinX = Math.min(...leftValues);
-          targetMaxX = Math.max(...rightValues);
-          targetMinY = Math.min(...topValues);
-          targetMaxY = Math.max(...bottomValues);
-        }
+        // Translate the original single-element or selection bounds with the gesture.
+        const targetMinX = originRange.minX + moveX;
+        const targetMaxX = originRange.maxX + moveX;
+        const targetMinY = originRange.minY + moveY;
+        const targetMaxY = originRange.maxY + moveY;
 
         const targetCenterX = targetMinX + (targetMaxX - targetMinX) / 2;
         const targetCenterY = targetMinY + (targetMaxY - targetMinY) / 2;
@@ -333,18 +260,16 @@ export function useDragElement(
         // In multi-select mode, also update positions of other selected elements
         // Their positions are calculated from the movement offset of the handle element
         else {
-          const handleElement = elementListRef.current.find((el) => el.id === element.id);
-          if (!handleElement) return;
-
-          newElements = elementListRef.current.map((el) => {
-            if (activeElementIdList.includes(el.id)) {
+          newElements = originElementList.map((el) => {
+            const projected = interactionById.get(el.id);
+            if (projected && activeElementIdList.includes(el.id)) {
               if (el.id === element.id) {
                 return { ...el, left: targetLeft, top: targetTop };
               }
               return {
                 ...el,
-                left: el.left + (targetLeft - handleElement.left),
-                top: el.top + (targetTop - handleElement.top),
+                left: projected.left + (targetLeft - elOriginLeft),
+                top: projected.top + (targetTop - elOriginTop),
               };
             }
             return el;
@@ -375,7 +300,7 @@ export function useDragElement(
         addHistorySnapshot();
       };
 
-      if (isTouchEvent) {
+      if (isTouch) {
         document.ontouchmove = handleMouseMove;
         document.ontouchend = handleMouseUp;
       } else {

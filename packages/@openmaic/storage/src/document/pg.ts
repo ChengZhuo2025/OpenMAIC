@@ -1,0 +1,1677 @@
+/**
+ * PostgreSQL DocumentStore backend over the same injected query surface as the
+ * runtime backend. Full stage and scene values live in JSONB so widened app
+ * shapes round-trip without the SQL schema knowing their fields. The stage's
+ * version-independent picker metadata and each scene's order are duplicated in
+ * ordinary columns: listDocuments never needs to decode content (or its version
+ * stamp), and ordered reads do not depend on JSON operators.
+ *
+ * `withTransaction` must check out a fresh connection and open a transaction
+ * for every call, pin every query in `body` to it, then commit or roll back and
+ * release it. READ COMMITTED isolation is assumed. JSON payloads are restricted
+ * to values that round-trip losslessly through JSONB.
+ */
+import {
+  DSL_VERSION,
+  DSL_VERSION_KEY,
+  dslVersionOf,
+  migrate,
+  needsMigration,
+  validateScene,
+  validateStage,
+} from '@openmaic/dsl';
+import type { Scene, Stage } from '@openmaic/dsl';
+import { reassembleDocument, splitDocument, type OutlineRow, type StageRow } from './adapter.js';
+import type {
+  DocumentStore,
+  DocumentFolder,
+  DocumentFolderStore,
+  DocumentSummary,
+  MaicDocument,
+  SceneLike,
+  SceneValidator,
+  StageFreshnessManifest,
+  StageFreshnessManifestStore,
+  StageValidator,
+} from './types.js';
+import { DocumentFolderLimitError, DocumentNotFoundError, DocumentVersionError } from './types.js';
+import {
+  claimOwnershipSql,
+  ownedByCondition,
+  ownerOfSql,
+  resolveDocumentOwnership,
+  type DocumentOwnershipRelation,
+  type ResolvedDocumentOwnership,
+} from './ownership.js';
+import {
+  documentAssetScopes,
+  forgetDocumentAssetWithdrawal,
+  recordAssetReferenceTracking,
+  recordDocumentAssetWithdrawal,
+  removeDocumentAssetReferences,
+  sceneAssetScope,
+  stageAssetScope,
+  syncDocumentAssetReferences,
+  syncStageAssetReferences,
+} from '../asset/references.js';
+import { assertJsonValue, isLosslessJsonString } from '../runtime/json-value.js';
+import { encodeJson } from '../pg-json.js';
+import { applySchemaMigrations, type SchemaMigrationSet } from '../pg-migrations.js';
+import { asStorageLockUnavailable } from '../runtime/pg.js';
+import type { Queryable, WithTransaction } from '../runtime/pg.js';
+
+export type { QueryResult, Queryable, WithTransaction } from '../runtime/pg.js';
+export type { DocumentOwnershipRelation } from './ownership.js';
+export { StorageLockUnavailableError, type StorageLockUnavailableReason } from '../runtime/pg.js';
+export { splitSqlStatements } from '../pg-migrations.js';
+
+export interface PgDocumentStoreOptions {
+  /**
+   * On every call, checks out a fresh connection, opens a transaction, pins
+   * every query in `body` to it, then commits or rolls back and releases it.
+   */
+  withTransaction: WithTransaction;
+  /** Scene write-boundary validator. Defaults to the DSL validateScene. */
+  validateScene?: SceneValidator;
+  /** Stage write-boundary validator. Defaults to the DSL validateStage. */
+  validateStage?: StageValidator;
+  /**
+   * The trusted owner this store acts for: whose folders it manages, whose
+   * asset principals its writes may reference ({@link assetReferencePrincipals}),
+   * and -- through {@link documentOwnership} -- whose documents it lists and
+   * writes. Reads by id remain capability-by-id. Usually set with
+   * {@link PgDocumentStore.forOwner} rather than here.
+   *
+   * Requires `documentOwnership` to be given explicitly (a relation, or
+   * `false`): an owner-bound store used to scope documents through a
+   * `document_stages.owner_id` column that no longer exists, and a store
+   * that silently stopped scoping would list and write every owner's
+   * documents.
+   */
+  ownerId?: string;
+  /**
+   * Where document ownership lives: the host's relation, which an owner-bound
+   * store scopes listings, writes, deletes and folder membership through.
+   * Unset is allowed only on a store that is not owner-bound.
+   *
+   * The relation must cascade with the document rows (a foreign key to
+   * `document_stages(id) ON DELETE CASCADE`), or the host must delete the
+   * ownership row whenever it deletes a document. A leftover ownership row
+   * keeps the id reserved for its owner: no other owner can create a document
+   * under it. That is also how a host keeps retired ids from being reused.
+   *
+   * `false` means this store does not scope documents by owner at all: an
+   * owner-bound store would then list, write and delete every owner's
+   * documents, and file any of them into its folders. It is accepted on an
+   * owner-bound store only together with
+   * {@link allowCrossOwnerDocumentAccess}, for a single-owner deployment or a
+   * host that gates every document call itself. Binding an owner only for
+   * folders or asset principals is not a reason to pass it.
+   *
+   * A store that is not owner-bound is tenant-agnostic whatever this says: it
+   * lists and writes every document.
+   */
+  documentOwnership?: DocumentOwnershipRelation | false;
+  /**
+   * The acknowledgement `documentOwnership: false` needs on an owner-bound
+   * store: every owner-bound call may reach every owner's documents. Ignored
+   * otherwise.
+   */
+  allowCrossOwnerDocumentAccess?: boolean;
+  /**
+   * Whether `document_stages` has the `folder_id` column the folder methods
+   * use. Defaults to `true` (`ensureDocumentSchema` provisions it). A host
+   * that provisions its own tables without folders sets `false`: listings
+   * then never read the column, and every folder method throws.
+   */
+  folders?: boolean;
+  /**
+   * Maintain the `document_asset_refs` table and the `asset_entries` lifecycle
+   * columns as a side effect of every write route. Defaults to `false`.
+   *
+   * Off by default because those are the ASSET backend's tables: a deployment
+   * that provisions documents without `ensureAssetSchema` has no such tables,
+   * and a write that referenced them would fail. A deployment that provisions
+   * both and turns this on gets server-owned asset reclamation; one that does
+   * not is byte-for-byte unaffected.
+   *
+   * Nothing about request or response shapes changes either way. The
+   * maintenance runs inside the write transactions this store already opens,
+   * so a reference row and the document write that implies it commit together
+   * or not at all.
+   */
+  trackAssetReferences?: boolean;
+  /**
+   * With `trackAssetReferences`, the asset principals whose entries a write by
+   * the bound owner may reference and commit, given that owner (`null` for an
+   * unbound store); `undefined` references any entry the registry holds (the
+   * default). An id naming another principal's entry records no reference and
+   * commits nothing -- the same as an unknown id -- and the write itself is
+   * never refused.
+   *
+   * A function of the owner rather than a list, and evaluated per write
+   * against the store's own `ownerId` (never a column of the document row), so
+   * a store re-bound with {@link PgDocumentStore.forOwner} scopes to the new
+   * owner: a fixed list
+   * would carry one owner's principals onto another owner's writes. A host
+   * whose asset registry is partitioned per owner returns the owner's own
+   * principal (plus any partition every owner may use), so one owner's
+   * document cannot commit or pin another owner's allocation. The collector's
+   * backfill takes the same function (`AssetCollectorOptions`), with the same
+   * `documentOwnership` relation to learn each document's owner from.
+   */
+  assetReferencePrincipals?: (ownerId: string | null) => readonly string[] | undefined;
+}
+
+/**
+ * Bound on how long one document write transaction may wait on a lock.
+ *
+ * Mirrors the asset registry's budget, and exists for the same reason: these
+ * transactions take the stage row's `FOR UPDATE` lock, and -- when reference
+ * tracking is on -- rows the offline asset collector locks too, so an
+ * unbounded wait would let one stuck holder hang writes indefinitely.
+ */
+const DOCUMENT_WRITE_LOCK_TIMEOUT_SQL = `SET LOCAL lock_timeout = '30s'`;
+
+/**
+ * A reference-maintaining operation was called on a store that does not
+ * maintain references.
+ *
+ * Thrown rather than answered, because there is no answer that is not a lie.
+ * Returning "nothing to withdraw" from a store that never recorded anything
+ * would let a host retire a document believing its assets were released while
+ * they sit referenced forever -- the failure this whole level exists to close.
+ * Reaching it means a store was constructed without `trackAssetReferences` and
+ * then asked to do something only a tracking store can do: a programming
+ * error, not a state a deployment can be in.
+ */
+export class DocumentAssetReferencesDisabledError extends Error {
+  constructor(operation: string) {
+    super(
+      `@openmaic/storage: ${operation} requires a document store constructed with ` +
+        'trackAssetReferences: true; this store does not maintain asset references',
+    );
+    this.name = 'DocumentAssetReferencesDisabledError';
+  }
+}
+
+/** Baseline (version 1) of the document schema: the DDL every start ran before migrations were versioned. */
+const DOCUMENT_PG_BASELINE = `
+CREATE TABLE IF NOT EXISTS document_folders (
+  owner_id TEXT NOT NULL,
+  id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  normalized_name TEXT NOT NULL,
+  created_at DOUBLE PRECISION NOT NULL,
+  updated_at DOUBLE PRECISION NOT NULL,
+  PRIMARY KEY (owner_id, id),
+  UNIQUE (owner_id, normalized_name)
+);
+
+ALTER TABLE document_folders
+  ADD COLUMN IF NOT EXISTS folder_order DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS document_folders_owner_order_idx
+  ON document_folders (owner_id, folder_order, id);
+
+CREATE TABLE IF NOT EXISTS document_stages (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  interactive_mode BOOLEAN,
+  task_engine_mode BOOLEAN,
+  created_at DOUBLE PRECISION NOT NULL,
+  updated_at DOUBLE PRECISION NOT NULL,
+  folder_id TEXT,
+  data JSONB NOT NULL
+);
+
+ALTER TABLE document_stages
+  ADD COLUMN IF NOT EXISTS folder_id TEXT;
+
+CREATE INDEX IF NOT EXISTS document_stages_folder_idx
+  ON document_stages (folder_id, id) WHERE folder_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS document_scenes (
+  stage_id TEXT NOT NULL REFERENCES document_stages(id) ON DELETE CASCADE,
+  id TEXT NOT NULL,
+  scene_order DOUBLE PRECISION NOT NULL,
+  data JSONB NOT NULL,
+  PRIMARY KEY (stage_id, id)
+);
+
+CREATE INDEX IF NOT EXISTS document_scenes_stage_order_idx
+  ON document_scenes (stage_id, scene_order, id);
+
+CREATE TABLE IF NOT EXISTS document_outlines (
+  stage_id TEXT PRIMARY KEY REFERENCES document_stages(id) ON DELETE CASCADE,
+  data JSONB NOT NULL
+);
+
+-- Per-scene monotonic revision signal, at the DB layer (ported from the
+-- reference implementation's migration 0071).
+--
+-- WHY THE DB LAYER: course content has several write seams that share no
+-- application-level signal (HTTP routes, agent tools, jobs, migration
+-- scripts, manual psql). Only a trigger can make "wrote but never signaled"
+-- unexpressible. These companion tables and triggers keep a monotonic
+-- per-stage revision and a per-scene revision on every insert/update/delete
+-- of document_stages / document_scenes. Companion tables instead of columns
+-- keep the document tables' authoritative DDL untouched.
+--
+-- LOCK ORDER INVARIANT: the scene trigger bumps document_stage_revision (SR)
+-- BEFORE document_scene_revision (SCR) — the same order saveDocument uses
+-- (stage upsert first, then per-scene upserts). Any future code that writes
+-- these two companion tables must take SR before SCR, or the deadlock (40P01)
+-- between concurrent stage-first and scene-first writers comes back.
+--
+-- NOTIFY: each bump emits a JSON route {kind:'stage',stageId} on the
+-- agent-event wakeup channel (the same channel the reference's agent event
+-- notify bus LISTENs on), so a stage notification wakes exactly the
+-- subscribers listening for that stage. The payload is built with
+-- json_build_object — never hand-concatenated, because a stageId containing
+-- quotes or backslashes would yield invalid JSON.
+--
+-- NOTIFY SUPPRESSION SWITCH: both triggers check
+-- current_setting('openmaic.suppress_stage_notify', true) before pg_notify.
+-- Batch/backfill writers MUST run SET LOCAL openmaic.suppress_stage_notify =
+-- 'on' inside each batch transaction: the revision still bumps, only the
+-- notification is skipped. NOTE: SET LOCAL outside a transaction block only
+-- emits a warning and has NO effect.
+--
+-- TRUNCATE DOES NOT FIRE ROW TRIGGERS: a TRUNCATE reset of document_scenes /
+-- document_stages leaves the companion revision rows behind, so any TRUNCATE
+-- reset must also truncate document_scene_revision and
+-- document_stage_revision.
+--
+-- IDEMPOTENT BY CONSTRUCTION: CREATE TABLE IF NOT EXISTS, CREATE OR REPLACE
+-- FUNCTION, DROP TRIGGER IF EXISTS — replayable in any environment.
+
+CREATE TABLE IF NOT EXISTS document_stage_revision (
+  stage_id TEXT PRIMARY KEY NOT NULL,
+  rev BIGINT DEFAULT 0 NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS document_scene_revision (
+  stage_id TEXT NOT NULL,
+  scene_id TEXT NOT NULL,
+  rev BIGINT DEFAULT 0 NOT NULL,
+  CONSTRAINT document_scene_revision_pkey PRIMARY KEY (stage_id, scene_id)
+);
+
+CREATE OR REPLACE FUNCTION openmaic_bump_scene_revision() RETURNS trigger AS $$
+DECLARE
+  v_stage_id text;
+  v_scene_id text;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    v_stage_id := OLD.stage_id;
+    v_scene_id := OLD.id;
+  ELSE
+    v_stage_id := NEW.stage_id;
+    v_scene_id := NEW.id;
+  END IF;
+  -- LOCK ORDER INVARIANT: SR row BEFORE the SCR row (see the header comment).
+  INSERT INTO document_stage_revision (stage_id, rev)
+  VALUES (v_stage_id, 1)
+  ON CONFLICT (stage_id) DO UPDATE SET rev = document_stage_revision.rev + 1;
+  INSERT INTO document_scene_revision (stage_id, scene_id, rev)
+  VALUES (v_stage_id, v_scene_id, 1)
+  ON CONFLICT (stage_id, scene_id) DO UPDATE SET rev = document_scene_revision.rev + 1;
+  IF coalesce(current_setting('openmaic.suppress_stage_notify', true), '') <> 'on' THEN
+    PERFORM pg_notify('openmaic_agent_event_wakeup', json_build_object('kind', 'stage', 'stageId', v_stage_id)::text);
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION openmaic_bump_stage_revision() RETURNS trigger AS $$
+DECLARE
+  v_stage_id text;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    v_stage_id := OLD.id;
+  ELSE
+    v_stage_id := NEW.id;
+  END IF;
+  INSERT INTO document_stage_revision (stage_id, rev)
+  VALUES (v_stage_id, 1)
+  ON CONFLICT (stage_id) DO UPDATE SET rev = document_stage_revision.rev + 1;
+  IF coalesce(current_setting('openmaic.suppress_stage_notify', true), '') <> 'on' THEN
+    PERFORM pg_notify('openmaic_agent_event_wakeup', json_build_object('kind', 'stage', 'stageId', v_stage_id)::text);
+  END IF;
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS openmaic_scene_revision_trigger ON document_scenes;
+
+CREATE TRIGGER openmaic_scene_revision_trigger
+AFTER INSERT OR UPDATE OR DELETE ON document_scenes
+FOR EACH ROW EXECUTE FUNCTION openmaic_bump_scene_revision();
+
+DROP TRIGGER IF EXISTS openmaic_stage_revision_trigger ON document_stages;
+
+CREATE TRIGGER openmaic_stage_revision_trigger
+AFTER INSERT OR UPDATE OR DELETE ON document_stages
+FOR EACH ROW EXECUTE FUNCTION openmaic_bump_stage_revision();
+`;
+
+/**
+ * Version 2: retire `document_stages.owner_id` on databases that still have
+ * it. A one-time step, so it no longer runs on every start.
+ */
+const DOCUMENT_PG_OWNER_COLUMN_RETIREMENT = `
+-- Document ownership is not recorded here: a host keeps it in its own
+-- relation (see DocumentOwnershipRelation). An installation created before
+-- that keeps its owner_id column for one release -- so a rollback still finds
+-- it, and a host can copy it into its relation first -- but nothing reads or
+-- writes it any more, and the next release drops it. A NOT NULL or a default
+-- a host added to it would fail or mislabel every new document, so both are
+-- relaxed. The catalog is asked first, and each ALTER runs only when it has
+-- something to change: an ALTER naming a column that is not there is an error,
+-- and one with nothing to change would still take an exclusive table lock on
+-- every boot. The indexes below served only the column.
+DO $document_stages_owner_retirement$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+      FROM pg_attribute
+     WHERE attrelid = to_regclass('document_stages')
+       AND attname = 'owner_id'
+       AND NOT attisdropped
+       AND attnotnull
+  ) THEN
+    ALTER TABLE document_stages ALTER COLUMN owner_id DROP NOT NULL;
+  END IF;
+  IF EXISTS (
+    SELECT 1
+      FROM pg_attribute
+     WHERE attrelid = to_regclass('document_stages')
+       AND attname = 'owner_id'
+       AND NOT attisdropped
+       AND atthasdef
+  ) THEN
+    ALTER TABLE document_stages ALTER COLUMN owner_id DROP DEFAULT;
+  END IF;
+END
+$document_stages_owner_retirement$;
+
+DROP INDEX IF EXISTS document_stages_owner_idx;
+
+DROP INDEX IF EXISTS document_stages_owner_folder_idx;
+`;
+
+/** The document backend's migrations, recorded under the store `document`. */
+export const DOCUMENT_PG_MIGRATIONS: SchemaMigrationSet = {
+  store: 'document',
+  migrations: [
+    { version: 1, name: 'baseline', up: DOCUMENT_PG_BASELINE, transaction: false },
+    {
+      version: 2,
+      name: 'retire_document_stages_owner_id',
+      up: DOCUMENT_PG_OWNER_COLUMN_RETIREMENT,
+    },
+  ],
+};
+
+/**
+ * The whole document schema as one idempotent script: every migration's SQL,
+ * in order. {@link ensureDocumentSchema} runs it through the migration runner;
+ * this is for a host that provisions the tables with its own tooling.
+ */
+export const DOCUMENT_PG_SCHEMA = DOCUMENT_PG_MIGRATIONS.migrations
+  .map((migration) => migration.up)
+  .join('');
+
+/**
+ * Create the tables owned by this backend, or bring an existing database up to
+ * date, by applying the pending {@link DOCUMENT_PG_MIGRATIONS}. Safe to call on
+ * every start; a schema change is a new migration.
+ *
+ * Runs are serialized across sessions (see `applySchemaMigrations`). A host
+ * that provisions several stores in one sequence, some of whose DDL depends on
+ * this one, may still serialize the whole sequence itself, for example under a
+ * `pg_advisory_lock` held on one connection.
+ */
+export async function ensureDocumentSchema(queryable: Queryable): Promise<void> {
+  await applySchemaMigrations(queryable, DOCUMENT_PG_MIGRATIONS);
+}
+
+const STAGE_REV_SQL = `
+  SELECT rev
+    FROM document_stage_revision
+   WHERE stage_id = $1
+`;
+
+const SCENES_SQL = `
+  SELECT s.id,
+         s.scene_order,
+         COALESCE(sr.rev, 0) AS rev
+    FROM document_scenes s
+    LEFT JOIN document_scene_revision sr
+      ON sr.stage_id = s.stage_id
+     AND sr.scene_id = s.id
+   WHERE s.stage_id = $1
+   ORDER BY s.scene_order ASC, s.id ASC
+`;
+
+/**
+ * Read the freshness manifest for one stage: the stage's monotonic revision
+ * plus every live scene's id/order/rev, produced by the triggers provisioned
+ * in `DOCUMENT_PG_SCHEMA`. A stage with no revision row yet reads as `rev: 0`
+ * (written before the triggers existed, or never written since); a scene the
+ * trigger never bumped also reads 0. Callers gate existence/visibility first
+ * (the owner-bound store method does), so this function assumes the stage
+ * exists and does not re-check it. Kept free of driver imports so the whole
+ * read is unit-testable against any queryable.
+ */
+export async function readStageFreshnessManifest(
+  stageId: string,
+  queryable: Queryable,
+): Promise<StageFreshnessManifest> {
+  const [stageRows, sceneRows] = await Promise.all([
+    queryable.query<{ rev: number | string }>(STAGE_REV_SQL, [stageId]),
+    queryable.query<{ id: string; scene_order: number | string; rev: number | string }>(
+      SCENES_SQL,
+      [stageId],
+    ),
+  ]);
+
+  return {
+    rev: stageRows.rows[0] === undefined ? 0 : Number(stageRows.rows[0].rev),
+    scenes: sceneRows.rows.map((row) => ({
+      id: row.id,
+      order: Number(row.scene_order),
+      rev: Number(row.rev),
+    })),
+  };
+}
+
+interface StoredJsonRow extends Record<string, unknown> {
+  data: unknown;
+}
+
+interface StoredSceneRow extends StoredJsonRow {
+  id: string;
+}
+
+interface SummaryRow extends Record<string, unknown> {
+  id: string;
+  name: string;
+  description: string | null;
+  interactive_mode: boolean | null;
+  task_engine_mode: boolean | null;
+  created_at: number | string;
+  updated_at: number | string;
+  scene_count: number | string;
+  folder_id: string | null;
+}
+
+interface FolderRow extends Record<string, unknown> {
+  id: string;
+  name: string;
+  folder_order: number | string;
+  created_at: number | string;
+  updated_at: number | string;
+}
+
+function assertValid(
+  result: { valid: true } | { valid: false; errors: { path: string; message: string }[] },
+  label: string,
+): void {
+  if (result.valid) return;
+  const detail = result.errors.map((error) => `${error.path || '/'}: ${error.message}`).join('; ');
+  throw new Error(`@openmaic/storage: invalid ${label}: ${detail}`);
+}
+
+function decodeJson<T>(value: unknown): T {
+  // node-postgres and PGlite decode JSONB for us. A host adapter may instead
+  // return object/array JSON as text, which is unambiguous for stage and scene
+  // payloads. Do not parse scalar strings: an opaque outline is allowed to be a
+  // string, and a corrupt stage scalar should reach the plain-object check.
+  if (typeof value === 'string' && /^[\s]*[{\[]/.test(value)) {
+    return JSON.parse(value) as T;
+  }
+  return value as T;
+}
+
+function isPlainObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function isFutureVersioned(versioned: unknown): boolean {
+  if (typeof versioned !== 'object' || versioned === null) return false;
+  return !needsMigration(versioned) && dslVersionOf(versioned) !== DSL_VERSION;
+}
+
+function migrateDocument<TScene extends SceneLike, TStage extends Stage>(
+  doc: MaicDocument<TScene, TStage>,
+): MaicDocument<TScene, TStage> {
+  const { outline, ...core } = doc;
+  const migrated = migrate(core) as MaicDocument<TScene, TStage>;
+  return outline === undefined ? migrated : { ...migrated, outline };
+}
+
+function assertStorableScene(scene: SceneLike, stageId: string): void {
+  const candidate = scene as { id: unknown; stageId: unknown; order: unknown };
+  if (typeof candidate.id !== 'string') {
+    throw new Error(
+      `@openmaic/storage: scene id must be a string, got ${JSON.stringify(candidate.id)}`,
+    );
+  }
+  if (candidate.stageId !== stageId) {
+    throw new Error(
+      `@openmaic/storage: scene ${JSON.stringify(candidate.id)} has stageId ` +
+        `${JSON.stringify(candidate.stageId)} but belongs to document ${JSON.stringify(stageId)}`,
+    );
+  }
+  if (typeof candidate.order !== 'number' || !Number.isFinite(candidate.order)) {
+    throw new Error(
+      `@openmaic/storage: scene ${JSON.stringify(candidate.id)} order must be a finite number, ` +
+        `got ${JSON.stringify(candidate.order)}`,
+    );
+  }
+}
+
+/** Input of {@link reassignDocumentFolders}. */
+export interface ReassignDocumentFoldersInput {
+  fromOwnerId: string;
+  toOwnerId: string;
+  /**
+   * The host's ownership relation, read to tell which filed documents are the
+   * source owner's. Must still name the source owner for its documents: run
+   * this before the ownership rows themselves are moved.
+   */
+  documentOwnership: DocumentOwnershipRelation;
+  /** Mints the id of a folder whose id the target already uses. Defaults to a random UUID. */
+  createFolderId?: () => string;
+}
+
+/** What {@link reassignDocumentFolders} did, one entry per source folder. */
+export interface DocumentFolderReassignment {
+  /** The source owner's folder id. */
+  fromFolderId: string;
+  /** The target folder its documents are filed in now. */
+  toFolderId: string;
+  /**
+   * `moved`: the folder moved as it was. `merged`: the target already had a
+   * folder of the same name (compared the way `createFolder` compares them),
+   * so the documents joined it and the source folder is gone. `renumbered`:
+   * the target already used the folder's id for a differently named folder,
+   * so the folder moved under a fresh id.
+   */
+  outcome: 'moved' | 'merged' | 'renumbered';
+}
+
+/**
+ * Move every folder of one owner to another, with the documents filed in
+ * them: the folder half of merging two owners' libraries. `queryable` must be
+ * an open transaction; the caller commits.
+ *
+ * Folder names are unique per owner (case-insensitively), and folder ids are
+ * unique per owner, so the two libraries can collide. Deterministically:
+ *
+ * - A source folder whose name the target already uses is merged into the
+ *   target's folder, which is what `createFolder` does with a second folder of
+ *   the same name: the documents are filed there and the source folder goes.
+ * - Otherwise, a source folder whose id the target already uses moves under a
+ *   fresh id, and its documents follow it.
+ * - Otherwise it moves unchanged.
+ *
+ * Moved folders are placed after the target's, in their original order. The
+ * folder limit is not applied: nothing is dropped, and a target above it
+ * cannot create folders until it is back under. Filing is rewritten in one
+ * statement from the old folder ids, so no document is re-filed twice when a
+ * fresh id or a merge target equals another source folder's old id.
+ */
+export async function reassignDocumentFolders(
+  queryable: Queryable,
+  input: ReassignDocumentFoldersInput,
+): Promise<DocumentFolderReassignment[]> {
+  const { fromOwnerId, toOwnerId } = input;
+  if (fromOwnerId === toOwnerId) return [];
+  const ownership = resolveDocumentOwnership(input.documentOwnership);
+  const createFolderId = input.createFolderId ?? (() => globalThis.crypto.randomUUID());
+  const rows = await queryable.query<FolderRow & { owner_id: string; normalized_name: string }>(
+    `SELECT owner_id, id, name, normalized_name, folder_order, created_at, updated_at
+       FROM document_folders
+      WHERE owner_id IN ($1, $2)
+      ORDER BY owner_id, id
+      FOR UPDATE`,
+    [fromOwnerId, toOwnerId],
+  );
+  const target = rows.rows.filter((row) => row.owner_id === toOwnerId);
+  const source = rows.rows
+    .filter((row) => row.owner_id === fromOwnerId)
+    .sort(
+      (a, b) =>
+        Number(a.folder_order) - Number(b.folder_order) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
+  if (source.length === 0) return [];
+  const targetByName = new Map(target.map((row) => [row.normalized_name, row.id]));
+  const usedIds = new Set(target.map((row) => row.id));
+  let order = target.reduce((max, row) => Math.max(max, Number(row.folder_order)), -1);
+  const plan: DocumentFolderReassignment[] = [];
+  const inserts: (typeof source)[number][] = [];
+  for (const folder of source) {
+    const merged = targetByName.get(folder.normalized_name);
+    if (merged !== undefined) {
+      plan.push({ fromFolderId: folder.id, toFolderId: merged, outcome: 'merged' });
+      continue;
+    }
+    let id = folder.id;
+    let outcome: DocumentFolderReassignment['outcome'] = 'moved';
+    if (usedIds.has(id)) {
+      do id = createFolderId();
+      while (usedIds.has(id) || !isPgQueryableKey(id));
+      outcome = 'renumbered';
+    }
+    usedIds.add(id);
+    targetByName.set(folder.normalized_name, id);
+    order += 1;
+    inserts.push({ ...folder, id, folder_order: order });
+    plan.push({ fromFolderId: folder.id, toFolderId: id, outcome });
+  }
+  const refiled = plan.filter((entry) => entry.fromFolderId !== entry.toFolderId);
+  if (refiled.length > 0) {
+    await queryable.query(
+      `UPDATE document_stages AS stages
+          SET folder_id = moves.to_id
+         FROM unnest($1::text[], $2::text[]) AS moves(from_id, to_id)
+        WHERE stages.folder_id = moves.from_id
+          AND ${ownedByCondition(ownership, 'stages.id', 3)}`,
+      [
+        refiled.map((entry) => entry.fromFolderId),
+        refiled.map((entry) => entry.toFolderId),
+        fromOwnerId,
+      ],
+    );
+  }
+  await queryable.query('DELETE FROM document_folders WHERE owner_id = $1', [fromOwnerId]);
+  for (const folder of inserts) {
+    await queryable.query(
+      `INSERT INTO document_folders
+         (owner_id, id, name, normalized_name, folder_order, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [
+        toOwnerId,
+        folder.id,
+        folder.name,
+        folder.normalized_name,
+        folder.folder_order,
+        Number(folder.created_at),
+        Number(folder.updated_at),
+      ],
+    );
+  }
+  return plan;
+}
+
+function isPgQueryableKey(value: string): boolean {
+  return isLosslessJsonString(value);
+}
+
+export class PgDocumentStore<TScene extends SceneLike = Scene, TStage extends Stage = Stage>
+  implements DocumentStore<TScene, TStage>, DocumentFolderStore, StageFreshnessManifestStore
+{
+  private readonly queryable: Queryable;
+  private readonly transactionHook: WithTransaction;
+  private readonly validateScene: SceneValidator;
+  private readonly validateStage: StageValidator;
+  private readonly ownerId: string | null;
+  /** The host's ownership relation, when this store scopes documents through one. */
+  private readonly ownership: ResolvedDocumentOwnership | null;
+  private readonly folders: boolean;
+  private readonly trackAssetReferences: boolean;
+  private readonly options: PgDocumentStoreOptions;
+
+  constructor(queryable: Queryable, options: PgDocumentStoreOptions) {
+    if (typeof options?.withTransaction !== 'function') {
+      throw new Error(
+        '@openmaic/storage: withTransaction is required and must pin a fresh connection and ' +
+          'transaction for every call; reusing a shared client lets concurrent transactions ' +
+          'interleave',
+      );
+    }
+    this.queryable = queryable;
+    this.transactionHook = options.withTransaction;
+    this.validateScene = options.validateScene ?? validateScene;
+    this.validateStage = options.validateStage ?? validateStage;
+    if (options.ownerId !== undefined && !isPgQueryableKey(options.ownerId)) {
+      throw new Error('@openmaic/storage: PgDocumentStore ownerId must be lossless JSON text');
+    }
+    if (options.ownerId !== undefined && options.documentOwnership === undefined) {
+      throw new Error(
+        '@openmaic/storage: an owner-bound PgDocumentStore requires documentOwnership -- the ' +
+          "host's ownership relation (or false with allowCrossOwnerDocumentAccess). " +
+          'document_stages no longer records an owner, so there is nothing to scope ' +
+          'through by default',
+      );
+    }
+    if (
+      options.ownerId !== undefined &&
+      options.documentOwnership === false &&
+      options.allowCrossOwnerDocumentAccess !== true
+    ) {
+      throw new Error(
+        '@openmaic/storage: documentOwnership: false on an owner-bound PgDocumentStore lets it ' +
+          "list, write and delete every owner's documents; pass " +
+          'allowCrossOwnerDocumentAccess: true to confirm that, or give it the ownership relation',
+      );
+    }
+    this.ownerId = options.ownerId ?? null;
+    this.ownership =
+      options.documentOwnership === undefined || options.documentOwnership === false
+        ? null
+        : resolveDocumentOwnership(options.documentOwnership);
+    this.folders = options.folders !== false;
+    this.trackAssetReferences = options.trackAssetReferences === true;
+    this.options = options;
+  }
+
+  /** The `principals` argument of the reference sync calls, when configured. */
+  private referencePrincipals(): { principals?: readonly string[] } {
+    const principals = this.options.assetReferencePrincipals?.(this.ownerId);
+    return principals === undefined ? {} : { principals };
+  }
+
+  /**
+   * Bind this store to one trusted owner: its folders, its asset principals,
+   * and -- through `documentOwnership` -- its documents. The binding needs
+   * `documentOwnership` configured (a relation, or `false`); see the option.
+   */
+  forOwner(ownerId: string): PgDocumentStore<TScene, TStage> {
+    return new PgDocumentStore(this.queryable, { ...this.options, ownerId });
+  }
+
+  /** The relation and owner this store scopes documents by, or `null` for none. */
+  private documentScope(): { ownership: ResolvedDocumentOwnership; ownerId: string } | null {
+    return this.ownership !== null && this.ownerId !== null
+      ? { ownership: this.ownership, ownerId: this.ownerId }
+      : null;
+  }
+
+  /**
+   * ` AND <owned>` for a query whose parameters are `params`, appending the
+   * owner parameter when this store scopes documents; `''` otherwise.
+   */
+  private ownedClause(stageExpression: string, params: unknown[], live = false): string {
+    const scope = this.documentScope();
+    if (scope === null) return '';
+    params.push(scope.ownerId);
+    return ` AND ${ownedByCondition(scope.ownership, stageExpression, params.length, live)}`;
+  }
+
+  /**
+   * Refuse a write to a document this store's owner does not hold.
+   *
+   * `exists` is whether the document row is already there (the caller has
+   * locked it). A row in the ownership relation naming another owner is
+   * refused; so is an existing document with no ownership row, which belongs
+   * to no one this store may act for. A new document with no ownership row is
+   * allowed: it is claimed after its rows are written, by this store
+   * (`claimOnCreate`) or by the host in the same transaction.
+   */
+  private async assertWritable(
+    queryable: Queryable,
+    stageId: string,
+    exists: boolean,
+  ): Promise<void> {
+    const scope = this.documentScope();
+    if (scope === null) return;
+    const owner = await queryable.query<{ owner_id: string }>(
+      ownerOfSql(scope.ownership, ' FOR SHARE'),
+      [stageId],
+    );
+    const holder = owner.rows[0]?.owner_id;
+    if (holder === scope.ownerId) return;
+    if (holder === undefined && !exists) return;
+    throw new DocumentNotFoundError(
+      stageId,
+      `@openmaic/storage: document ${JSON.stringify(stageId)} belongs to another scope`,
+    );
+  }
+
+  /** Whether this store's owner holds `stageId` (always true when unscoped). */
+  private async ownsDocument(queryable: Queryable, stageId: string): Promise<boolean> {
+    const scope = this.documentScope();
+    if (scope === null) return true;
+    const owner = await queryable.query<{ owner_id: string }>(
+      ownerOfSql(scope.ownership, ' FOR SHARE'),
+      [stageId],
+    );
+    return owner.rows[0]?.owner_id === scope.ownerId;
+  }
+
+  /**
+   * With `claimOnCreate`, record this store's owner as the owner of a
+   * document it just created, and refuse (rolling the create back) when a
+   * concurrent create by another owner got there first.
+   */
+  private async claimCreated(queryable: Queryable, stageId: string): Promise<void> {
+    const scope = this.documentScope();
+    if (scope === null || !scope.ownership.claimOnCreate) return;
+    const inserted = await queryable.query<{ owner_id: string }>(
+      claimOwnershipSql(scope.ownership),
+      [stageId, scope.ownerId],
+    );
+    if (inserted.rows[0]?.owner_id === scope.ownerId) return;
+    if (await this.ownsDocument(queryable, stageId)) return;
+    throw new DocumentNotFoundError(
+      stageId,
+      `@openmaic/storage: document ${JSON.stringify(stageId)} belongs to another scope`,
+    );
+  }
+
+  private requireFolders(operation: string): void {
+    if (!this.folders) {
+      throw new Error(
+        `@openmaic/storage: ${operation} requires folders; this store was constructed with ` +
+          'folders: false',
+      );
+    }
+  }
+
+  private async transaction<T>(body: (queryable: Queryable) => Promise<T>): Promise<T> {
+    return this.transactionHook(body);
+  }
+
+  /**
+   * A write transaction: the same fresh pinned connection as
+   * {@link transaction}, plus a lock-wait budget.
+   *
+   * Every write path here locks the stage row (`FOR UPDATE`) and, with
+   * reference tracking on, entry rows the asset collector also locks. A wait
+   * that outlives this bound is a stuck transaction or a lock-contention bug,
+   * and must surface as a loud error rather than hang a request for as long
+   * as the holder stays stuck. The same budget, for the same reason, as the
+   * asset registry's write transactions.
+   */
+  private async writeTransaction<T>(body: (queryable: Queryable) => Promise<T>): Promise<T> {
+    try {
+      return await this.transactionHook(async (queryable) => {
+        await queryable.query(DOCUMENT_WRITE_LOCK_TIMEOUT_SQL);
+        return body(queryable);
+      });
+    } catch (error) {
+      // The budget above manufactures this failure, so this layer owes the
+      // caller a type for it: a host retries or alerts on contention and does
+      // neither on a genuine write error, and telling them apart should not
+      // require matching a driver's SQLSTATE. The driver's error stays as
+      // `cause`, and everything else propagates untouched.
+      const contention = asStorageLockUnavailable(error);
+      if (contention) throw contention;
+      throw error;
+    }
+  }
+
+  private requireOwner(operation: string): string {
+    this.requireFolders(operation);
+    if (this.ownerId === null) {
+      throw new Error(`@openmaic/storage: ${operation} requires an owner-bound document store`);
+    }
+    return this.ownerId;
+  }
+
+  private async loadStage(
+    queryable: Queryable,
+    stageId: string,
+    lock: 'share' | 'update' | false = false,
+  ): Promise<StageRow<TStage> | undefined> {
+    const suffix = lock === 'share' ? ' FOR SHARE' : lock === 'update' ? ' FOR UPDATE' : '';
+    const result = await queryable.query<StoredJsonRow>(
+      `SELECT data
+         FROM document_stages
+        WHERE id = $1${suffix}`,
+      [stageId],
+    );
+    const storedRow = result.rows[0];
+    if (!storedRow) return undefined;
+    const decoded = decodeJson<unknown>(storedRow.data);
+    if (!isPlainObject(decoded)) {
+      throw new Error(
+        `@openmaic/storage: corrupt stored row for document ${JSON.stringify(stageId)}: ` +
+          'data must be a plain object',
+      );
+    }
+    return decoded as StageRow<TStage>;
+  }
+
+  private async loadRows(
+    queryable: Queryable,
+    stageId: string,
+    lock: 'share' | 'update' = 'share',
+  ): Promise<
+    { stageRow: StageRow<TStage>; sceneRows: TScene[]; outlineRow?: OutlineRow } | undefined
+  > {
+    const stageRow = await this.loadStage(queryable, stageId, lock);
+    if (!stageRow) return undefined;
+    const scenes = await queryable.query<StoredJsonRow>(
+      `SELECT data
+         FROM document_scenes
+        WHERE stage_id = $1
+        ORDER BY scene_order ASC, id ASC`,
+      [stageId],
+    );
+    const outline = await queryable.query<StoredJsonRow>(
+      `SELECT data
+         FROM document_outlines
+        WHERE stage_id = $1`,
+      [stageId],
+    );
+    const sceneRows = scenes.rows.map((row) => decodeJson<TScene>(row.data));
+    const outlineRow = outline.rows[0]
+      ? { stageId, outline: decodeJson<unknown>(outline.rows[0].data) }
+      : undefined;
+    return { stageRow, sceneRows, outlineRow };
+  }
+
+  private currentVersionError(
+    operation: string,
+    stageId: string,
+    stageRow: StageRow<TStage>,
+  ): DocumentVersionError {
+    return new DocumentVersionError(
+      stageId,
+      'not-current',
+      stageRow[DSL_VERSION_KEY],
+      `@openmaic/storage: cannot ${operation} document ${JSON.stringify(stageId)} at DSL ` +
+        `version ${JSON.stringify(dslVersionOf(stageRow))} — load and save it to bring it ` +
+        `to ${DSL_VERSION} first`,
+    );
+  }
+
+  private validateForSave(
+    doc: MaicDocument<TScene, TStage>,
+  ): ReturnType<typeof splitDocument<TScene, TStage>> {
+    assertValid(this.validateStage(doc.stage), `stage ${doc.stage.id}`);
+    const stageId = doc.stage.id;
+    const seen = new Set<string>();
+    for (const scene of doc.scenes) {
+      assertValid(this.validateScene(scene), `scene ${scene.id}`);
+      assertStorableScene(scene, stageId);
+      if (seen.has(scene.id)) {
+        throw new Error(
+          `@openmaic/storage: duplicate scene id ${JSON.stringify(scene.id)} in document ` +
+            JSON.stringify(stageId),
+        );
+      }
+      seen.add(scene.id);
+    }
+    const rows = splitDocument(doc);
+    assertJsonValue(rows.stageRow, `document stage ${JSON.stringify(stageId)}`);
+    for (const scene of rows.sceneRows) {
+      assertJsonValue(scene, `document scene ${JSON.stringify(scene.id)}`);
+    }
+    if (rows.outlineRow) {
+      assertJsonValue(rows.outlineRow.outline, `document outline ${JSON.stringify(stageId)}`);
+    }
+    return rows;
+  }
+
+  private async persistStage(queryable: Queryable, stageRow: StageRow<TStage>): Promise<void> {
+    await queryable.query(
+      `INSERT INTO document_stages
+         (id, name, description, interactive_mode, task_engine_mode, created_at, updated_at,
+          data)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb)
+       ON CONFLICT (id) DO UPDATE
+         SET name = EXCLUDED.name,
+             description = EXCLUDED.description,
+             interactive_mode = EXCLUDED.interactive_mode,
+             task_engine_mode = EXCLUDED.task_engine_mode,
+             created_at = EXCLUDED.created_at,
+             updated_at = EXCLUDED.updated_at,
+             data = EXCLUDED.data`,
+      [
+        stageRow.id,
+        stageRow.name,
+        stageRow.description ?? null,
+        stageRow.interactiveMode ?? null,
+        stageRow.taskEngineMode ?? null,
+        stageRow.createdAt,
+        stageRow.updatedAt,
+        encodeJson(stageRow, `document stage ${JSON.stringify(stageRow.id)}`),
+      ],
+    );
+  }
+
+  async saveDocument(doc: MaicDocument<TScene, TStage>): Promise<void> {
+    if (isFutureVersioned(doc)) {
+      throw new DocumentVersionError(
+        doc.stage.id,
+        'future',
+        doc.dslVersion,
+        `@openmaic/storage: refusing to save document ${JSON.stringify(doc.stage.id)} — it was ` +
+          `written at DSL version ${JSON.stringify(dslVersionOf(doc))}, newer than this ` +
+          `client's ${DSL_VERSION}`,
+      );
+    }
+    const normalized = migrateDocument(doc);
+    const { stageRow, sceneRows, outlineRow } = this.validateForSave(normalized);
+    const stageId = stageRow.id;
+
+    await this.writeTransaction(async (queryable) => {
+      const existingStage = await this.loadStage(queryable, stageId, 'update');
+      if (existingStage && isFutureVersioned(existingStage)) {
+        throw new DocumentVersionError(
+          stageId,
+          'future',
+          existingStage[DSL_VERSION_KEY],
+          `@openmaic/storage: refusing to overwrite document ${JSON.stringify(stageId)} — the ` +
+            `stored copy is at DSL version ${JSON.stringify(dslVersionOf(existingStage))}, newer ` +
+            `than this client's ${DSL_VERSION}`,
+        );
+      }
+
+      // Ownership is decided before anything is written, against the host's
+      // relation rather than a column of the row: the stage row is locked
+      // above, so a concurrent writer cannot slip between the check and the
+      // write.
+      await this.assertWritable(queryable, stageId, existingStage !== undefined);
+      await this.persistStage(queryable, stageRow);
+      if (existingStage === undefined) await this.claimCreated(queryable, stageId);
+      const existingScenes = await queryable.query<StoredSceneRow>(
+        `SELECT id, data
+           FROM document_scenes
+          WHERE stage_id = $1`,
+        [stageId],
+      );
+      const incomingIds = new Set(sceneRows.map((scene) => scene.id));
+      for (const scene of sceneRows) {
+        await queryable.query(
+          `INSERT INTO document_scenes (stage_id, id, scene_order, data)
+           VALUES ($1, $2, $3, $4::jsonb)
+           ON CONFLICT (stage_id, id) DO UPDATE
+             SET scene_order = EXCLUDED.scene_order,
+                 data = EXCLUDED.data`,
+          [
+            stageId,
+            scene.id,
+            scene.order,
+            encodeJson(scene, `document scene ${JSON.stringify(scene.id)}`),
+          ],
+        );
+      }
+      for (const scene of existingScenes.rows) {
+        if (!incomingIds.has(scene.id)) {
+          await queryable.query('DELETE FROM document_scenes WHERE stage_id = $1 AND id = $2', [
+            stageId,
+            scene.id,
+          ]);
+        }
+      }
+
+      if (outlineRow) {
+        await queryable.query(
+          `INSERT INTO document_outlines (stage_id, data)
+           VALUES ($1, $2::jsonb)
+           ON CONFLICT (stage_id) DO UPDATE SET data = EXCLUDED.data`,
+          [stageId, encodeJson(outlineRow.outline, `document outline ${JSON.stringify(stageId)}`)],
+        );
+      } else {
+        await queryable.query('DELETE FROM document_outlines WHERE stage_id = $1', [stageId]);
+      }
+
+      // A full save is authoritative over the whole stage, so it replaces
+      // every reference row the stage had -- including the rows of scenes this
+      // save removed above, which contribute no scope and therefore do not
+      // come back. In the same transaction as the rows it describes.
+      if (this.trackAssetReferences) {
+        await syncStageAssetReferences(queryable, {
+          stageId,
+          scopes: documentAssetScopes({ stage: stageRow, scenes: sceneRows }),
+          ...this.referencePrincipals(),
+        });
+      }
+    });
+  }
+
+  async loadDocument(stageId: string): Promise<MaicDocument<TScene, TStage> | null> {
+    if (!isPgQueryableKey(stageId)) return null;
+    const rows = await this.transaction((queryable) => this.loadRows(queryable, stageId));
+    if (!rows) return null;
+    return migrateDocument(reassembleDocument(rows.stageRow, rows.sceneRows, rows.outlineRow));
+  }
+
+  async readFreshnessManifest(stageId: string): Promise<StageFreshnessManifest | null> {
+    if (!isPgQueryableKey(stageId)) return null;
+    return this.transaction(async (queryable) => {
+      // Existence and ownership gate, exactly like loadDocument: a foreign or
+      // missing stage answers the same null. The revision read itself is
+      // un-scoped (readStageFreshnessManifest assumes the stage exists).
+      const params: unknown[] = [stageId];
+      const scoped = await queryable.query<{ id: string }>(
+        `SELECT stages.id
+           FROM document_stages AS stages
+          WHERE stages.id = $1${this.ownedClause('stages.id', params)}`,
+        params,
+      );
+      if (scoped.rows.length === 0) return null;
+      return readStageFreshnessManifest(stageId, queryable);
+    });
+  }
+
+  async createFolder(
+    folderId: string,
+    name: string,
+    limit = 50,
+  ): Promise<{ folder: DocumentFolder; reused: boolean }> {
+    const ownerId = this.requireOwner('createFolder');
+    if (!isPgQueryableKey(folderId) || !isPgQueryableKey(name)) {
+      throw new Error('@openmaic/storage: folder id and name must be lossless JSON text');
+    }
+    const normalizedName = name.toLocaleLowerCase('en-US');
+    return this.transaction(async (queryable) => {
+      const existing = await queryable.query<FolderRow>(
+        `SELECT id, name, folder_order, created_at, updated_at
+           FROM document_folders
+          WHERE owner_id = $1 AND normalized_name = $2
+          LIMIT 1`,
+        [ownerId, normalizedName],
+      );
+      if (existing.rows[0]) {
+        const row = existing.rows[0];
+        return {
+          folder: {
+            id: row.id,
+            name: row.name,
+            order: Number(row.folder_order),
+            createdAt: Number(row.created_at),
+            updatedAt: Number(row.updated_at),
+          },
+          reused: true,
+        };
+      }
+      const count = await queryable.query<{ count: number | string }>(
+        'SELECT COUNT(*)::text AS count FROM document_folders WHERE owner_id = $1',
+        [ownerId],
+      );
+      if (Number(count.rows[0]?.count ?? 0) >= limit) throw new DocumentFolderLimitError(limit);
+      const now = Date.now();
+      // Same order rule as the local model: a new folder goes after the
+      // current maximum (folders are displayed by `order` ascending).
+      const maxOrder = await queryable.query<{ max: number | string | null }>(
+        `SELECT MAX(folder_order)::text AS max
+           FROM document_folders
+          WHERE owner_id = $1`,
+        [ownerId],
+      );
+      const order = Number(maxOrder.rows[0]?.max ?? -1) + 1;
+      const inserted = await queryable.query<FolderRow>(
+        `INSERT INTO document_folders
+           (owner_id, id, name, normalized_name, folder_order, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)
+         ON CONFLICT (owner_id, normalized_name) DO UPDATE
+           SET normalized_name = EXCLUDED.normalized_name
+         RETURNING id, name, folder_order, created_at, updated_at`,
+        [ownerId, folderId, name, normalizedName, order, now],
+      );
+      const row = inserted.rows[0]!;
+      return {
+        folder: {
+          id: row.id,
+          name: row.name,
+          order: Number(row.folder_order),
+          createdAt: Number(row.created_at),
+          updatedAt: Number(row.updated_at),
+        },
+        reused: row.id !== folderId,
+      };
+    });
+  }
+
+  async listFolders(): Promise<DocumentFolder[]> {
+    const ownerId = this.requireOwner('listFolders');
+    const result = await this.queryable.query<FolderRow>(
+      `SELECT id, name, folder_order, created_at, updated_at
+         FROM document_folders
+        WHERE owner_id = $1
+        ORDER BY folder_order ASC, id ASC`,
+      [ownerId],
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      order: Number(row.folder_order),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    }));
+  }
+
+  async renameFolder(id: string, name: string): Promise<DocumentFolder | null> {
+    const ownerId = this.requireOwner('renameFolder');
+    if (!isPgQueryableKey(id) || !isPgQueryableKey(name)) {
+      throw new Error('@openmaic/storage: folder id and name must be lossless JSON text');
+    }
+    const normalizedName = name.toLocaleLowerCase('en-US');
+    const updated = await this.queryable.query<FolderRow>(
+      `UPDATE document_folders
+          SET name = $3, normalized_name = $4, updated_at = $5
+        WHERE owner_id = $1 AND id = $2
+        RETURNING id, name, folder_order, created_at, updated_at`,
+      [ownerId, id, name, normalizedName, Date.now()],
+    );
+    const row = updated.rows[0];
+    if (!row) return null;
+    return {
+      id: row.id,
+      name: row.name,
+      order: Number(row.folder_order),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+    };
+  }
+
+  async deleteFolder(
+    id: string,
+    mode: 'ungroup' | 'remove',
+  ): Promise<{ removedStageIds: string[] } | null> {
+    const ownerId = this.requireOwner('deleteFolder');
+    if (!isPgQueryableKey(id)) return null;
+    return this.transaction(async (queryable) => {
+      // Capture the filed documents before the folder row goes away. Folder
+      // ids are unique only per owner, so membership is scoped through the
+      // ownership relation as well: the captured ids are exactly the caller's
+      // own courses, never another owner's filed under the same folder id.
+      let removedStageIds: string[] = [];
+      if (mode === 'remove') {
+        const params: unknown[] = [id];
+        const members = await queryable.query<{ id: string }>(
+          `SELECT stages.id
+             FROM document_stages AS stages
+            WHERE stages.folder_id = $1${this.ownedClause('stages.id', params)}
+            ORDER BY stages.id ASC`,
+          params,
+        );
+        removedStageIds = members.rows.map((row) => row.id);
+      }
+      // Clear the membership of every filed document: 'ungroup' keeps the
+      // courses (they become unfiled), 'remove' hands them to the caller's
+      // cascade without leaving dangling folder pointers behind.
+      const clearParams: unknown[] = [id];
+      await queryable.query(
+        `UPDATE document_stages AS stages
+            SET folder_id = NULL
+          WHERE stages.folder_id = $1${this.ownedClause('stages.id', clearParams)}`,
+        clearParams,
+      );
+      const deleted = await queryable.query<{ id: string }>(
+        `DELETE FROM document_folders
+          WHERE owner_id = $1 AND id = $2
+          RETURNING id`,
+        [ownerId, id],
+      );
+      if (deleted.rows.length === 0) return null;
+      return { removedStageIds };
+    });
+  }
+
+  async moveDocumentToFolder(stageId: string, folderId: string): Promise<boolean> {
+    return this.setStageFolder(stageId, folderId);
+  }
+
+  async setStageFolder(stageId: string, folderId: string | null): Promise<boolean> {
+    const ownerId = this.requireOwner('setStageFolder');
+    if (!isPgQueryableKey(stageId)) return false;
+    if (folderId === null) {
+      // Un-file: a missing membership row already means unfiled, so this is
+      // idempotent and never refuses (the route's contract for folderId null).
+      const params: unknown[] = [stageId];
+      await this.queryable.query(
+        `UPDATE document_stages AS stages
+            SET folder_id = NULL
+          WHERE stages.id = $1${this.ownedClause('stages.id', params)}`,
+        params,
+      );
+      return true;
+    }
+    if (!isPgQueryableKey(folderId)) return false;
+    const params: unknown[] = [stageId, folderId, ownerId];
+    const result = await this.queryable.query<{ id: string }>(
+      `UPDATE document_stages AS stages
+          SET folder_id = $2
+        WHERE stages.id = $1
+          AND EXISTS (
+            SELECT 1
+              FROM document_folders AS folders
+             WHERE folders.owner_id = $3 AND folders.id = $2
+          )${this.ownedClause('stages.id', params)}
+      RETURNING stages.id`,
+      params,
+    );
+    return result.rows.length === 1;
+  }
+
+  async listDocuments(folderId?: string): Promise<DocumentSummary[]> {
+    if (folderId !== undefined) this.requireFolders('listDocuments(folderId)');
+    if (folderId !== undefined && (!isPgQueryableKey(folderId) || this.ownerId === null)) return [];
+    const params: unknown[] = [];
+    let folderFilter = '';
+    if (folderId !== undefined) {
+      params.push(folderId);
+      folderFilter = ` AND stages.folder_id = $${params.length}`;
+    }
+    // Owned and not retired, through the host's relation, when this store
+    // scopes documents; every document otherwise.
+    const owned = this.ownedClause('stages.id', params, true);
+    const result = await this.queryable.query<SummaryRow>(
+      `SELECT stages.id,
+              stages.name,
+              stages.description,
+              stages.interactive_mode,
+              stages.task_engine_mode,
+              stages.created_at,
+              stages.updated_at,
+              ${this.folders ? 'stages.folder_id' : 'NULL::text AS folder_id'},
+              COUNT(scenes.id)::text AS scene_count
+         FROM document_stages AS stages
+         LEFT JOIN document_scenes AS scenes ON scenes.stage_id = stages.id
+        WHERE TRUE${folderFilter}${owned}
+        GROUP BY stages.id
+        ORDER BY stages.id ASC`,
+      params,
+    );
+    return result.rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      ...(row.description === null ? {} : { description: row.description }),
+      ...(row.interactive_mode === null ? {} : { interactiveMode: row.interactive_mode }),
+      ...(row.task_engine_mode === null ? {} : { taskEngineMode: row.task_engine_mode }),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      sceneCount: Number(row.scene_count),
+      ...(row.folder_id === null ? {} : { folderId: row.folder_id }),
+    }));
+  }
+
+  /**
+   * Declare that every document writer on this database maintains asset
+   * references, without waiting for a write to prove it.
+   *
+   * The collector refuses its entry level until something has recorded that a
+   * reference-maintaining store exists, because an empty reference table
+   * cannot be told apart from documents that reference nothing. That marker is
+   * otherwise written only as a side effect of a reference-maintaining
+   * document write -- never by `ensureAssetSchema` and never by the backfill --
+   * so a freshly installed deployment, or an existing one that has just turned
+   * tracking on, refuses on every scheduled pass until somebody happens to
+   * save a document. The backfill cannot even start, nothing is reclaimed, and
+   * a host watching for that refusal reads a healthy deployment as a broken
+   * configuration.
+   *
+   * Calling this at startup, once the schemas are ensured, makes the entry
+   * level and the backfill eligible immediately. It is a **statement about the
+   * deployment**, not about this store: it says that every writer against this
+   * database is configured to maintain references, which only the host
+   * assembling them can know. A host that cannot say that must not call it --
+   * the refusal it would silence is the one thing standing between a
+   * half-configured deployment and deleting live media.
+   *
+   * Idempotent, and it has no other effect: no reference row, no lifecycle
+   * column, no document. Requires `trackAssetReferences`, because a store that
+   * does not maintain references cannot honestly declare that anything does.
+   */
+  async declareAssetReferenceTracking(): Promise<void> {
+    if (!this.trackAssetReferences) {
+      throw new DocumentAssetReferencesDisabledError('declareAssetReferenceTracking');
+    }
+    // The same upsert the write paths run, in the same shape of transaction --
+    // one statement, and the write paths' lock-wait budget, so two hosts
+    // starting at once cannot leave one of them waiting unboundedly on a row
+    // that is contended for a moment at boot.
+    await this.writeTransaction((queryable) => recordAssetReferenceTracking(queryable));
+  }
+
+  /**
+   * Withdraw every asset reference a document holds, without deleting the
+   * document.
+   *
+   * For a host that retires a document by TOMBSTONE rather than by deletion:
+   * one whose own table marks the id as permanently retired, and whose
+   * tombstone has to outlive the document row it points at. Such a host can
+   * never call {@link deleteDocument} -- doing so would take the tombstone
+   * with it and let the retired id be claimed again -- so its retired
+   * documents would otherwise keep every asset they name alive forever. This
+   * is the half of `deleteDocument` that releases assets, on its own.
+   *
+   * Answers whether this store found the document: `false` for an id that is
+   * absent or belongs to another scope, which are indistinguishable here for
+   * the same reason they are in `deleteDocument`. It is NOT "something
+   * changed" -- the document row is untouched, so a second call finds the same
+   * document and answers **`true`** again with nothing left to remove. The
+   * operation is idempotent in effect, which is what a retirement path needs:
+   * a host that retries after a crash cannot tell, and does not need to tell,
+   * whether the first attempt got there.
+   *
+   * The document rows themselves are deliberately left alone, so re-saving the
+   * stage re-establishes its references exactly as any other write does. A
+   * host that un-retires a document by saving it again gets its assets
+   * recommitted, with no special path.
+   *
+   * **A withdrawal that races the collector's one-time backfill is honoured.**
+   * That walk reads stored JSON, which a retirement does not change, so it
+   * would otherwise re-reference what this released; the record this writes is
+   * what holds it off, and is the only reason the walk ever skips a document
+   * whose row is still there. There is no ordering a host has to observe
+   * between retiring a document and finishing an upgrade.
+   *
+   * Requires `trackAssetReferences`; see
+   * {@link DocumentAssetReferencesDisabledError} for why calling it without
+   * that throws instead of answering.
+   */
+  async withdrawAssetReferences(stageId: string): Promise<boolean> {
+    if (!this.trackAssetReferences) {
+      throw new DocumentAssetReferencesDisabledError('withdrawAssetReferences');
+    }
+    if (!isPgQueryableKey(stageId)) return false;
+    return this.writeTransaction(async (queryable) => {
+      // Same gate, in the same order, as deleteDocument: the scoped stage row
+      // is locked first, so a foreign or missing stage withdraws nothing and
+      // cannot drop another scope's reference rows. Holding that lock also
+      // serializes this against a concurrent write to the same stage, which
+      // would otherwise re-insert the rows this is removing.
+      const params: unknown[] = [stageId];
+      const scoped = await queryable.query<{ id: string }>(
+        `SELECT stages.id FROM document_stages AS stages
+          WHERE stages.id = $1${this.ownedClause('stages.id', params)}
+          FOR UPDATE`,
+        params,
+      );
+      if (scoped.rows.length === 0) return false;
+      // Every scope of the stage -- stage-level rows and every scene's -- and
+      // the same stamping deleteDocument does, so an entry that loses its last
+      // reference drains after the collector's grace period rather than
+      // immediately.
+      await removeDocumentAssetReferences(queryable, { stageId });
+      // The document stays, which is the whole point, so the retirement needs
+      // a trace of its own: the collector's one-time backfill reads stored
+      // JSON, and a retired document's JSON still names everything it ever
+      // named. Recorded under the stage lock taken above, so a withdrawal and
+      // that walk cannot interleave into a re-reference.
+      await recordDocumentAssetWithdrawal(queryable, stageId);
+      return true;
+    });
+  }
+
+  async deleteDocument(stageId: string): Promise<void> {
+    if (!isPgQueryableKey(stageId)) return;
+    if (this.trackAssetReferences) {
+      await this.writeTransaction(async (queryable) => {
+        // Asset reference rows carry no foreign key to `document_stages` --
+        // they belong to the asset backend, which a deployment may not even
+        // provision -- so nothing cascades them away and this delete has to
+        // remove them itself. It also has to STAMP the entries that lose their
+        // last reference, which a cascade could never do: without the stamp a
+        // deleted course's entries would sit referenced-by-nothing forever.
+        //
+        // Gated on the scoped stage first: a foreign or missing stage deletes
+        // no document, and must not drop another scope's reference rows.
+        const params: unknown[] = [stageId];
+        const scoped = await queryable.query<{ id: string }>(
+          `SELECT stages.id FROM document_stages AS stages
+            WHERE stages.id = $1${this.ownedClause('stages.id', params)}
+            FOR UPDATE`,
+          params,
+        );
+        if (scoped.rows.length === 0) return;
+        await removeDocumentAssetReferences(queryable, { stageId });
+        // A retirement record must not outlive the document it describes. Left
+        // behind, it would be inherited by whatever later claims this id: the
+        // walk would skip that document, and on a deployment where some writer
+        // does not track references there would be no write to clear it.
+        await forgetDocumentAssetWithdrawal(queryable, stageId);
+        // The row is locked and its ownership checked above.
+        await queryable.query('DELETE FROM document_stages WHERE id = $1', [stageId]);
+      });
+      return;
+    }
+    // One statement; both child tables are removed by their FK cascades.
+    const params: unknown[] = [stageId];
+    await this.queryable.query(
+      `DELETE FROM document_stages AS stages
+        WHERE stages.id = $1${this.ownedClause('stages.id', params)}`,
+      params,
+    );
+  }
+
+  async putStage(stageId: string, stage: TStage): Promise<void> {
+    assertValid(this.validateStage(stage), `stage ${stage.id}`);
+    if (stage.id !== stageId) {
+      throw new Error(
+        `@openmaic/storage: stage ${JSON.stringify(stage.id)} does not belong to document ` +
+          JSON.stringify(stageId),
+      );
+    }
+    const stageRow = { ...stage, [DSL_VERSION_KEY]: DSL_VERSION } as StageRow<TStage>;
+    assertJsonValue(stageRow, `document stage ${JSON.stringify(stageId)}`);
+    await this.writeTransaction(async (queryable) => {
+      const stored = await this.loadStage(queryable, stageId, 'update');
+      if (!stored) {
+        throw new DocumentNotFoundError(
+          stageId,
+          `@openmaic/storage: cannot putStage into missing document ${JSON.stringify(stageId)}`,
+        );
+      }
+      if (dslVersionOf(stored) !== DSL_VERSION) {
+        throw this.currentVersionError('putStage into', stageId, stored);
+      }
+      await this.assertWritable(queryable, stageId, true);
+      await this.persistStage(queryable, stageRow);
+      // Stage-level rows only: this write cannot have changed what any scene
+      // holds, so touching a scene's rows here would drop references the
+      // scenes still carry.
+      if (this.trackAssetReferences) {
+        await syncDocumentAssetReferences(queryable, {
+          stageId,
+          scope: stageAssetScope(stageRow),
+          ...this.referencePrincipals(),
+        });
+      }
+    });
+  }
+
+  async putScene(stageId: string, scene: TScene): Promise<void> {
+    assertValid(this.validateScene(scene), `scene ${scene.id}`);
+    assertStorableScene(scene, stageId);
+    assertJsonValue(scene, `document scene ${JSON.stringify(scene.id)}`);
+    await this.writeTransaction(async (queryable) => {
+      const stored = await this.loadStage(queryable, stageId, 'update');
+      if (!stored) {
+        throw new DocumentNotFoundError(
+          stageId,
+          `@openmaic/storage: cannot putScene into missing document ${JSON.stringify(stageId)}`,
+        );
+      }
+      if (dslVersionOf(stored) !== DSL_VERSION) {
+        throw this.currentVersionError('putScene into', stageId, stored);
+      }
+      await this.assertWritable(queryable, stageId, true);
+      await queryable.query(
+        `INSERT INTO document_scenes (stage_id, id, scene_order, data)
+         VALUES ($1, $2, $3, $4::jsonb)
+         ON CONFLICT (stage_id, id) DO UPDATE
+           SET scene_order = EXCLUDED.scene_order,
+               data = EXCLUDED.data`,
+        [
+          stageId,
+          scene.id,
+          scene.order,
+          encodeJson(scene, `document scene ${JSON.stringify(scene.id)}`),
+        ],
+      );
+      // This scene's rows only. The media write-back path writes one scene at
+      // a time, so this is the write that first names a freshly allocated id
+      // and therefore the write that commits its entry.
+      if (this.trackAssetReferences) {
+        await syncDocumentAssetReferences(queryable, {
+          stageId,
+          scope: sceneAssetScope(scene.id, scene),
+          ...this.referencePrincipals(),
+        });
+      }
+    });
+  }
+
+  async getScene(stageId: string, sceneId: string): Promise<TScene | null> {
+    if (!isPgQueryableKey(stageId) || !isPgQueryableKey(sceneId)) return null;
+    return this.transaction(async (queryable) => {
+      const stageRow = await this.loadStage(queryable, stageId, 'share');
+      if (!stageRow) return null;
+      if (!needsMigration(stageRow)) {
+        const result = await queryable.query<StoredJsonRow>(
+          `SELECT data
+             FROM document_scenes
+            WHERE stage_id = $1 AND id = $2`,
+          [stageId, sceneId],
+        );
+        return result.rows[0] ? decodeJson<TScene>(result.rows[0].data) : null;
+      }
+      const scenes = await queryable.query<StoredJsonRow>(
+        `SELECT data
+           FROM document_scenes
+          WHERE stage_id = $1
+          ORDER BY scene_order ASC, id ASC`,
+        [stageId],
+      );
+      const outline = await queryable.query<StoredJsonRow>(
+        'SELECT data FROM document_outlines WHERE stage_id = $1',
+        [stageId],
+      );
+      const outlineRow = outline.rows[0]
+        ? { stageId, outline: decodeJson<unknown>(outline.rows[0].data) }
+        : undefined;
+      const document = migrateDocument(
+        reassembleDocument(
+          stageRow,
+          scenes.rows.map((row) => decodeJson<TScene>(row.data)),
+          outlineRow,
+        ),
+      );
+      return document.scenes.find((scene) => scene.id === sceneId) ?? null;
+    });
+  }
+
+  async deleteScene(stageId: string, sceneId: string): Promise<void> {
+    if (!isPgQueryableKey(stageId) || !isPgQueryableKey(sceneId)) return;
+    await this.writeTransaction(async (queryable) => {
+      const stored = await this.loadStage(queryable, stageId, 'update');
+      if (!stored) return;
+      // A foreign document is as absent to this store as a missing one.
+      if (!(await this.ownsDocument(queryable, stageId))) return;
+      if (dslVersionOf(stored) !== DSL_VERSION) {
+        throw this.currentVersionError('deleteScene from', stageId, stored);
+      }
+      await queryable.query('DELETE FROM document_scenes WHERE stage_id = $1 AND id = $2', [
+        stageId,
+        sceneId,
+      ]);
+      if (this.trackAssetReferences) {
+        await removeDocumentAssetReferences(queryable, { stageId, sceneId });
+      }
+    });
+  }
+}

@@ -1,0 +1,518 @@
+import type {
+  ProviderConfig,
+  ProviderId,
+  ThinkingCapability,
+  ThinkingEffort,
+  ThinkingLevel,
+  ThinkingRequestAdapter,
+} from '@/lib/types/provider';
+import { getCanonicalModelId } from './model-aliases';
+
+export function getModelMetadataKey(providerId: string, modelId: string): string {
+  return `${providerId}:${modelId}`;
+}
+
+function effortCapability(
+  requestAdapter: ThinkingRequestAdapter,
+  effortValues: ThinkingEffort[],
+  defaultEffort: ThinkingEffort,
+): ThinkingCapability {
+  return {
+    control: 'effort',
+    requestAdapter,
+    effortValues,
+    defaultEffort,
+    defaultMode: effortValues.includes('none') ? 'disabled' : 'enabled',
+    toggleable: effortValues.includes('none'),
+    budgetAdjustable: true,
+    defaultEnabled: !effortValues.includes('none'),
+  };
+}
+
+function levelCapability(
+  levelValues: ThinkingLevel[],
+  defaultLevel: ThinkingLevel,
+): ThinkingCapability {
+  return {
+    control: 'level',
+    requestAdapter: 'google',
+    levelValues,
+    defaultLevel,
+    defaultMode: 'enabled',
+    toggleable: false,
+    budgetAdjustable: true,
+    defaultEnabled: true,
+  };
+}
+
+function toggleCapability(
+  requestAdapter: ThinkingRequestAdapter,
+  defaultEnabled = true,
+): ThinkingCapability {
+  return {
+    control: 'toggle',
+    requestAdapter,
+    defaultMode: defaultEnabled ? 'enabled' : 'disabled',
+    toggleable: true,
+    budgetAdjustable: false,
+    defaultEnabled,
+  };
+}
+
+function toggleBudgetCapability(
+  requestAdapter: ThinkingRequestAdapter,
+  range: { min: number; max: number; step?: number; allowDynamic?: boolean; disableValue?: number },
+  defaultEnabled = false,
+  defaultBudgetTokens?: number,
+): ThinkingCapability {
+  return {
+    control: 'toggle-budget',
+    requestAdapter,
+    budgetRange: range,
+    defaultBudgetTokens,
+    defaultMode: defaultEnabled ? 'enabled' : 'disabled',
+    toggleable: true,
+    budgetAdjustable: true,
+    defaultEnabled,
+  };
+}
+
+function budgetOnlyCapability(
+  requestAdapter: ThinkingRequestAdapter,
+  range: { min: number; max: number; step?: number; allowDynamic?: boolean },
+  defaultBudgetTokens?: number,
+): ThinkingCapability {
+  return {
+    control: 'budget-only',
+    requestAdapter,
+    budgetRange: range,
+    defaultBudgetTokens,
+    defaultMode: 'enabled',
+    toggleable: false,
+    budgetAdjustable: true,
+    defaultEnabled: true,
+  };
+}
+
+const fixedThinkingCapability: ThinkingCapability = {
+  control: 'none',
+  requestAdapter: 'none',
+  defaultMode: 'enabled',
+  toggleable: false,
+  budgetAdjustable: false,
+  defaultEnabled: true,
+};
+
+const anthropicManualBudgetByEffort: Partial<Record<ThinkingEffort, number>> = {
+  low: 4096,
+  medium: 10240,
+  high: 32768,
+  max: 64000,
+};
+
+const anthropicManualEffort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'anthropic',
+  effortValues: ['none', 'low', 'medium', 'high', 'max'],
+  defaultEffort: 'medium',
+  defaultMode: 'enabled',
+  toggleable: true,
+  budgetAdjustable: true,
+  defaultEnabled: true,
+  anthropicThinking: {
+    type: 'enabled',
+    budgetByEffort: anthropicManualBudgetByEffort,
+  },
+};
+
+const anthropicAdaptiveEffort: ThinkingCapability = {
+  ...anthropicManualEffort,
+  anthropicThinking: { type: 'adaptive' },
+};
+
+const anthropicBudget: ThinkingCapability = toggleBudgetCapability(
+  'anthropic',
+  { min: 1024, max: 64000, step: 1024 },
+  false,
+  1024,
+);
+
+const anthropicOpus47Effort: ThinkingCapability = {
+  ...anthropicAdaptiveEffort,
+  effortValues: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+};
+
+const anthropicClaude5Effort: ThinkingCapability = {
+  ...anthropicOpus47Effort,
+  defaultEffort: 'high',
+  defaultMode: 'enabled',
+  defaultEnabled: true,
+};
+
+// Fable 5 always uses adaptive thinking. The API rejects both disabled thinking
+// and budget_tokens, so reasoning depth is controlled by effort only.
+const anthropicFable5Effort: ThinkingCapability = {
+  ...anthropicOpus47Effort,
+  effortValues: ['low', 'medium', 'high', 'xhigh', 'max'],
+  defaultEffort: 'high',
+  toggleable: false,
+  budgetAdjustable: false,
+};
+
+const kimiK3Effort = effortCapability('openai', ['low', 'high', 'max'], 'max');
+
+// TokenDance 网关统一 reasoning_effort（见 THINKING_CAPABILITIES 末尾的注释）
+const tokendanceEffort = effortCapability('openai', ['low', 'medium', 'high'], 'medium');
+const grok46Effort = effortCapability('openai', ['low', 'medium', 'high', 'xhigh'], 'high');
+const grok45Effort = effortCapability('openai', ['low', 'medium', 'high'], 'high');
+const grok43Effort = effortCapability('openai', ['none', 'low', 'medium', 'high'], 'none');
+
+const deepseekEffort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'deepseek',
+  effortValues: ['none', 'high', 'max'],
+  defaultEffort: 'high',
+  defaultMode: 'enabled',
+  toggleable: true,
+  budgetAdjustable: true,
+  defaultEnabled: true,
+};
+
+const glm52Effort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'glm',
+  effortValues: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  defaultEffort: 'max',
+  defaultMode: 'enabled',
+  toggleable: true,
+  budgetAdjustable: true,
+  defaultEnabled: true,
+};
+
+// GLM-5.3 / GLM-5.3-Flash always think; depth is controlled by effort only
+// (the API rejects thinking.type "disabled": "该模型始终思考,不支持关闭思考").
+const glm53Effort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'glm',
+  effortValues: ['low', 'high', 'max'],
+  defaultEffort: 'max',
+  defaultMode: 'enabled',
+  toggleable: false,
+  budgetAdjustable: false,
+  defaultEnabled: true,
+};
+
+const hunyuanHy3Effort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'hunyuan',
+  effortValues: ['none', 'low', 'high'],
+  defaultEffort: 'none',
+  defaultMode: 'disabled',
+  toggleable: true,
+  budgetAdjustable: true,
+  defaultEnabled: false,
+};
+
+const lemonadeToggleBudget = toggleBudgetCapability(
+  'lemonade',
+  { min: 0, max: 81920, step: 1024, disableValue: 0 },
+  false,
+);
+
+const qwenBudgetEnabled = toggleBudgetCapability(
+  'qwen',
+  { min: 0, max: 81920, step: 1024, disableValue: 0 },
+  true,
+);
+
+const qwenBudgetDisabled = toggleBudgetCapability(
+  'qwen',
+  { min: 0, max: 81920, step: 1024, disableValue: 0 },
+  false,
+);
+
+const siliconflowBudget = budgetOnlyCapability(
+  'siliconflow',
+  { min: 128, max: 32768, step: 1024 },
+  4096,
+);
+
+const siliconflowToggleBudget = toggleBudgetCapability(
+  'siliconflow',
+  { min: 128, max: 32768, step: 1024, disableValue: 0 },
+  true,
+  4096,
+);
+
+const doubaoSeed20Effort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'doubao',
+  effortValues: ['minimal', 'low', 'medium', 'high'],
+  defaultEffort: 'medium',
+  defaultMode: 'enabled',
+  toggleable: true,
+  budgetAdjustable: true,
+  defaultEnabled: true,
+};
+
+const minimaxM3Thinking = toggleCapability('anthropic', false);
+
+const openaiGpt56Effort: ThinkingCapability = {
+  control: 'effort',
+  requestAdapter: 'openai',
+  effortValues: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+  defaultEffort: 'medium',
+  defaultMode: 'enabled',
+  toggleable: true,
+  budgetAdjustable: true,
+  defaultEnabled: true,
+};
+
+const THINKING_CAPABILITIES: Record<string, ThinkingCapability> = {
+  [getModelMetadataKey('openai', 'gpt-5.6')]: openaiGpt56Effort,
+  [getModelMetadataKey('openai', 'gpt-5.6-terra')]: openaiGpt56Effort,
+  [getModelMetadataKey('openai', 'gpt-5.6-luna')]: openaiGpt56Effort,
+  [getModelMetadataKey('openai', 'gpt-5.5')]: effortCapability(
+    'openai',
+    ['low', 'medium', 'high', 'xhigh'],
+    'medium',
+  ),
+  [getModelMetadataKey('openai', 'gpt-5.4-pro')]: effortCapability(
+    'openai',
+    ['medium', 'high', 'xhigh'],
+    'medium',
+  ),
+  [getModelMetadataKey('openai', 'gpt-5.4')]: effortCapability(
+    'openai',
+    ['none', 'low', 'medium', 'high', 'xhigh'],
+    'none',
+  ),
+  [getModelMetadataKey('openai', 'gpt-5.4-mini')]: effortCapability(
+    'openai',
+    ['none', 'low', 'medium', 'high', 'xhigh'],
+    'none',
+  ),
+  [getModelMetadataKey('openai', 'gpt-5.4-nano')]: effortCapability(
+    'openai',
+    ['none', 'low', 'medium', 'high', 'xhigh'],
+    'none',
+  ),
+
+  [getModelMetadataKey('anthropic', 'claude-fable-5')]: anthropicFable5Effort,
+  [getModelMetadataKey('anthropic', 'claude-opus-5')]: anthropicClaude5Effort,
+  [getModelMetadataKey('anthropic', 'claude-sonnet-5')]: anthropicClaude5Effort,
+  [getModelMetadataKey('anthropic', 'claude-opus-4-8')]: anthropicOpus47Effort,
+  [getModelMetadataKey('anthropic', 'claude-opus-4-7')]: anthropicOpus47Effort,
+  [getModelMetadataKey('anthropic', 'claude-opus-4-6')]: anthropicAdaptiveEffort,
+  [getModelMetadataKey('anthropic', 'claude-sonnet-4-6')]: anthropicAdaptiveEffort,
+  [getModelMetadataKey('anthropic', 'claude-sonnet-4-5')]: anthropicManualEffort,
+  [getModelMetadataKey('anthropic', 'claude-haiku-4-5')]: anthropicBudget,
+
+  // gemini-3.8/3.7-flash: thinking always on; levels low|medium|high, default medium
+  // ("minimal is not supported and returns an error" — docs, 12.09.2026).
+  [getModelMetadataKey('google', 'gemini-3.8-flash')]: levelCapability(
+    ['low', 'medium', 'high'],
+    'medium',
+  ),
+  [getModelMetadataKey('google', 'gemini-3.7-flash')]: levelCapability(
+    ['low', 'medium', 'high'],
+    'medium',
+  ),
+  [getModelMetadataKey('google', 'gemini-3.6-flash')]: levelCapability(
+    ['minimal', 'low', 'medium', 'high'],
+    'medium',
+  ),
+  [getModelMetadataKey('google', 'gemini-3.5-flash-lite')]: levelCapability(
+    ['minimal', 'low', 'medium', 'high'],
+    'minimal',
+  ),
+  [getModelMetadataKey('google', 'gemini-3.5-flash')]: levelCapability(
+    ['minimal', 'low', 'medium', 'high'],
+    'medium',
+  ),
+  [getModelMetadataKey('google', 'gemini-3.1-pro-preview')]: levelCapability(
+    ['minimal', 'low', 'medium', 'high'],
+    'high',
+  ),
+  [getModelMetadataKey('google', 'gemini-3-flash-preview')]: levelCapability(
+    ['minimal', 'low', 'medium', 'high'],
+    'high',
+  ),
+  [getModelMetadataKey('google', 'gemini-2.5-flash')]: toggleBudgetCapability(
+    'google',
+    { min: 0, max: 24576, step: 1024, allowDynamic: true, disableValue: 0 },
+    true,
+    -1,
+  ),
+  [getModelMetadataKey('google', 'gemini-2.5-flash-lite')]: toggleBudgetCapability(
+    'google',
+    { min: 0, max: 24576, step: 1024, allowDynamic: true, disableValue: 0 },
+    false,
+    0,
+  ),
+  [getModelMetadataKey('google', 'gemini-2.5-pro')]: budgetOnlyCapability(
+    'google',
+    { min: 128, max: 32768, step: 1024, allowDynamic: true },
+    -1,
+  ),
+
+  [getModelMetadataKey('glm', 'glm-5.3')]: glm53Effort,
+  [getModelMetadataKey('glm', 'glm-5.3-flash')]: glm53Effort,
+  [getModelMetadataKey('glm', 'glm-5.2')]: glm52Effort,
+  [getModelMetadataKey('glm', 'glm-5.1')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-5v-turbo')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-5')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-4.7')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-4.7-flashx')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-4.7-flash')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-4.6')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-4.6v')]: toggleCapability('glm'),
+  [getModelMetadataKey('glm', 'glm-4.6v-flash')]: toggleCapability('glm'),
+
+  [getModelMetadataKey('qwen', 'qwen3.7-plus')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.7-max')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.6-plus')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.6-plus-2026-04-02')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.6-flash')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.6-flash-2026-04-16')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.6-35b-a3b')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.5-flash')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3.5-plus')]: qwenBudgetEnabled,
+  [getModelMetadataKey('qwen', 'qwen3-vl-plus')]: qwenBudgetDisabled,
+
+  [getModelMetadataKey('deepseek', 'deepseek-v4-pro')]: deepseekEffort,
+  [getModelMetadataKey('deepseek', 'deepseek-flash')]: deepseekEffort,
+  [getModelMetadataKey('atlascloud', 'deepseek-ai/deepseek-v4-pro')]: deepseekEffort,
+
+  [getModelMetadataKey('kimi', 'kimi-k3')]: kimiK3Effort,
+  // Kimi Coding Plan 的套餐模型 id（K3 家族与 K2.8 coding 系列）：与对应
+  // 官方目录条目同款思考能力，token plan 播种目录后行内思考控件可用。
+  [getModelMetadataKey('kimi', 'k3')]: kimiK3Effort,
+  [getModelMetadataKey('kimi', 'k3-256k')]: kimiK3Effort,
+  [getModelMetadataKey('kimi', 'kimi-for-coding')]: fixedThinkingCapability,
+  [getModelMetadataKey('kimi', 'kimi-for-coding-highspeed')]: fixedThinkingCapability,
+  [getModelMetadataKey('kimi', 'kimi-k2.7-code')]: fixedThinkingCapability,
+  [getModelMetadataKey('kimi', 'kimi-k2.7-code-highspeed')]: fixedThinkingCapability,
+  [getModelMetadataKey('kimi', 'kimi-k2.6')]: toggleCapability('kimi'),
+
+  [getModelMetadataKey('siliconflow', 'deepseek-ai/DeepSeek-V3.2')]: siliconflowToggleBudget,
+  [getModelMetadataKey('siliconflow', 'deepseek-ai/DeepSeek-R1')]: siliconflowBudget,
+  [getModelMetadataKey('siliconflow', 'Qwen/Qwen3-VL-32B-Instruct')]: siliconflowToggleBudget,
+
+  [getModelMetadataKey('doubao', 'doubao-seed-2-1-pro-260628')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-2-1-turbo-260628')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-evolving')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-character-260628')]: toggleCapability('doubao'),
+  [getModelMetadataKey('doubao', 'doubao-seed-2-0-pro-260215')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-2-0-lite-260215')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-2-0-mini-260215')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-2.0-mini')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-2.1-pro')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'doubao-seed-2.1-lite')]: doubaoSeed20Effort,
+  // Agent Plan documents GLM 5.3 and Kimi K3 as always thinking. Keep the
+  // existing native models' effort levels, using Ark's request serialization.
+  [getModelMetadataKey('doubao', 'glm-5.3')]: { ...glm53Effort, requestAdapter: 'doubao' },
+  [getModelMetadataKey('doubao', 'kimi-k3')]: {
+    ...kimiK3Effort,
+    requestAdapter: 'doubao',
+    toggleable: false,
+  },
+  [getModelMetadataKey('doubao', 'kimi-k2.8-preview')]: fixedThinkingCapability,
+  // Cross-vendor models the Ark Agent Plan also serves through its
+  // OpenAI-compatible endpoint (all under the `doubao` provider id). Verified
+  // against a live plan key: each accepts the gateway's unified `reasoning_effort`
+  // field (low/medium/high) and actually reasons, so they share the doubao
+  // effort adapter — which sends `minimal` (not `none`) to disable, matching
+  // what the plan endpoint accepts. The token-plan preset seeds these aliases.
+  [getModelMetadataKey('doubao', 'deepseek-v4-pro')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'deepseek-v4-flash')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'kimi-k2.7-code')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'minimax-m3')]: doubaoSeed20Effort,
+  [getModelMetadataKey('doubao', 'ark-code-latest')]: doubaoSeed20Effort,
+
+  [getModelMetadataKey('openrouter', 'deepseek/deepseek-v4-pro')]: effortCapability(
+    'openrouter',
+    ['low', 'medium', 'high'],
+    'medium',
+  ),
+  [getModelMetadataKey('openrouter', 'deepseek/deepseek-v4-flash')]: effortCapability(
+    'openrouter',
+    ['low', 'medium', 'high'],
+    'medium',
+  ),
+
+  [getModelMetadataKey('grok', 'grok-4.6')]: grok46Effort,
+  [getModelMetadataKey('grok', 'grok-4.5')]: grok45Effort,
+  [getModelMetadataKey('grok', 'grok-4.3')]: grok43Effort,
+  [getModelMetadataKey('grok', 'grok-build-0.1')]: fixedThinkingCapability,
+  [getModelMetadataKey('grok', 'grok-4.20-reasoning')]: fixedThinkingCapability,
+  [getModelMetadataKey('grok', 'grok-4.20-multi-agent')]: fixedThinkingCapability,
+
+  [getModelMetadataKey('minimax', 'MiniMax-M3')]: minimaxM3Thinking,
+  [getModelMetadataKey('minimax', 'MiniMax-M2.7')]: fixedThinkingCapability,
+  // Same always-on record as M2.7 (requestAdapter none): no extra thinking
+  // field is sent. Highspeed variants keep the base model's effect.
+  [getModelMetadataKey('minimax', 'MiniMax-M2.7-highspeed')]: fixedThinkingCapability,
+  [getModelMetadataKey('minimax', 'MiniMax-M2.5')]: fixedThinkingCapability,
+  [getModelMetadataKey('minimax', 'MiniMax-M2.5-highspeed')]: fixedThinkingCapability,
+  [getModelMetadataKey('minimax', 'MiniMax-M2.1')]: fixedThinkingCapability,
+  [getModelMetadataKey('minimax', 'MiniMax-M2.1-highspeed')]: fixedThinkingCapability,
+  [getModelMetadataKey('minimax', 'MiniMax-M2')]: fixedThinkingCapability,
+
+  [getModelMetadataKey('tencent-hunyuan', 'hy3')]: hunyuanHy3Effort,
+
+  [getModelMetadataKey('xiaomi', 'mimo-v2.6-pro')]: toggleCapability('xiaomi'),
+  [getModelMetadataKey('xiaomi', 'mimo-v2.6-flash')]: toggleCapability('xiaomi'),
+  [getModelMetadataKey('xiaomi', 'mimo-v2.5-pro')]: toggleCapability('xiaomi'),
+  [getModelMetadataKey('xiaomi', 'mimo-v2.5')]: toggleCapability('xiaomi'),
+
+  [getModelMetadataKey('lemonade', 'Qwen3-4B-GGUF')]: lemonadeToggleBudget,
+  [getModelMetadataKey('lemonade', 'Qwen3.5-4B-GGUF')]: lemonadeToggleBudget,
+  [getModelMetadataKey('lemonade', 'Gemma-4-26B-A4B-it-GGUF')]: lemonadeToggleBudget,
+  [getModelMetadataKey('lemonade', 'gpt-oss-20b')]: lemonadeToggleBudget,
+  [getModelMetadataKey('lemonade', 'GPT-OSS-20B-GGUF')]: lemonadeToggleBudget,
+
+  // TokenDance 网关（OpenAI 兼容，/gateway/v1）：套餐目录统一透传网关的
+  // reasoning_effort 字段（low/medium/high）——包括网关自有的 cogevol 系列
+  // 和跨厂商模型（各家原生思考传输不经网关透传，统一走网关字段；与火山
+  // Ark 套餐跨厂商模型的口径一致）。
+  [getModelMetadataKey('tokendance', 'cogevol-base')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'cogevol-slide-0828')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'cogevol-interactive-0828')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'deepseek-v4.1-flash')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'deepseek-v4-pro')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'glm-5.3')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'kimi-k3')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'qwen3.8-max')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'seed-2.1-pro')]: tokendanceEffort,
+  [getModelMetadataKey('tokendance', 'minimax-m3')]: tokendanceEffort,
+};
+
+export function getCatalogThinkingCapability(
+  providerId: string,
+  modelId: string,
+): ThinkingCapability | undefined {
+  const canonicalModelId = getCanonicalModelId(providerId, modelId);
+  const exact = THINKING_CAPABILITIES[getModelMetadataKey(providerId, canonicalModelId)];
+  if (exact) return exact;
+
+  if (providerId === 'lemonade') {
+    return lemonadeToggleBudget;
+  }
+
+  return undefined;
+}
+
+export function applyModelMetadata(providers: Record<ProviderId, ProviderConfig>): void {
+  for (const provider of Object.values(providers)) {
+    for (const model of provider.models) {
+      const thinking = getCatalogThinkingCapability(provider.id, model.id);
+      if (thinking) {
+        model.capabilities = {
+          ...model.capabilities,
+          thinking,
+        };
+      }
+    }
+  }
+}

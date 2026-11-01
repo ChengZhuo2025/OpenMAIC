@@ -1,846 +1,294 @@
 'use client';
 
-import { useEffect, useState, Suspense, useRef } from 'react';
-import { useRouter } from 'next/navigation';
+/**
+ * The generation preview: a view of the server-side run that generates the
+ * course (RFC #1754 §E). The page renders the run's events (steps, the
+ * outline as it streams, the outline review, the agent cards) and sends the
+ * run its commands (confirm the outline, retry a failed step); the run itself
+ * goes on whether or not this page is open. Once the course's first scene is
+ * ready, the classroom takes over.
+ */
+import { useEffect, useMemo, useRef, useState, Suspense } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { motion, AnimatePresence } from 'motion/react';
-import { CheckCircle2, Sparkles, AlertCircle, AlertTriangle, ArrowLeft, Bot } from 'lucide-react';
+import { Sparkles, AlertCircle, ArrowLeft, Bot, RefreshCw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
+import { OutlinesEditor } from '@/components/generation/outlines-editor';
 import { cn } from '@/lib/utils';
-import { useStageStore } from '@/lib/store/stage';
 import { useSettingsStore } from '@/lib/store/settings';
-import { useAgentRegistry } from '@/lib/orchestration/registry/store';
-import { getAvailableProvidersWithVoices } from '@/lib/audio/voice-resolver';
 import { useI18n } from '@/lib/hooks/use-i18n';
-import {
-  loadImageMapping,
-  loadPdfBlob,
-  cleanupOldImages,
-  storeImages,
-} from '@/lib/utils/image-storage';
-import { getCurrentModelConfig } from '@/lib/utils/model-config';
-import { db } from '@/lib/utils/database';
-import { MAX_PDF_CONTENT_CHARS, MAX_VISION_IMAGES } from '@/lib/constants/generation';
-import { nanoid } from 'nanoid';
-import type { Stage } from '@/lib/types/stage';
-import type { SceneOutline, PdfImage, ImageMapping } from '@/lib/types/generation';
+import { useModelCapabilities } from '@/lib/model-settings/use-model-settings';
+import type { SceneOutline } from '@/lib/types/generation';
 import { AgentRevealModal } from '@/components/agent/agent-reveal-modal';
 import { createLogger } from '@/lib/logger';
-import { type GenerationSessionState, ALL_STEPS, getActiveSteps } from './types';
-import { StepVisualizer } from './components/visualizers';
+import { RunApiError, runApiErrorText } from '@/lib/generation-run-client/api';
+import { toast } from 'sonner';
+import { runFailureText, type FailureText } from '@/lib/generation-run-client/failure-message';
+import { confirmOutline, holdOutline, retryPausedRun } from '@/lib/generation-run-client/commands';
+import { nextPreviewPhase, type PreviewPhase } from '@/lib/generation-run-client/outline-review';
+import { previewStepIds, previewStepIndex } from '@/lib/generation-run-client/preview-steps';
+import { visibleOutlines } from '@/lib/generation-run-client/reducer';
+import { useGenerationRun } from '@/lib/generation-run-client/use-generation-run';
+import { ALL_STEPS } from './types';
+import { StepVisualizer } from '@/components/generation/step-visualizers';
 
 const log = createLogger('GenerationPreview');
+
+/** The learner opened the outline review of this run (kept across a reload of the page). */
+function reviewIntentKey(runId: string): string {
+  return `generationRunReviewIntent:${runId}`;
+}
+
+function readReviewIntent(runId: string): boolean {
+  try {
+    return sessionStorage.getItem(reviewIntentKey(runId)) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function writeReviewIntent(runId: string, intent: boolean): void {
+  try {
+    if (intent) sessionStorage.setItem(reviewIntentKey(runId), '1');
+    else sessionStorage.removeItem(reviewIntentKey(runId));
+  } catch {
+    /* sessionStorage unavailable: the intent lasts for this page only */
+  }
+}
 
 function GenerationPreviewContent() {
   const router = useRouter();
   const { t } = useI18n();
-  const hasStartedRef = useRef(false);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const runId = useSearchParams().get('run');
+  const { view, status, caughtUp, refresh } = useGenerationRun(runId);
+  const capabilities = useModelCapabilities();
 
-  const [session, setSession] = useState<GenerationSessionState | null>(null);
-  const [sessionLoaded, setSessionLoaded] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [currentStepIndex, setCurrentStepIndex] = useState(0);
-  const [isComplete] = useState(false);
-  const [statusMessage, setStatusMessage] = useState('');
-  const [streamingOutlines, setStreamingOutlines] = useState<SceneOutline[] | null>(null);
-  const [truncationWarnings, setTruncationWarnings] = useState<string[]>([]);
-  const [webSearchSources, setWebSearchSources] = useState<Array<{ title: string; url: string }>>(
-    [],
-  );
+  // Sticky: true once the learner opens the review of a run that waits for
+  // it while the outline streams, until they collapse it again (kept across a
+  // reload).
+  const outlineReviewIntentRef = useRef(false);
+  // The phase the outline step is shown in: the progress card or the review editor.
+  const [phase, setPhase] = useState<PreviewPhase>('progress');
+  const [editedOutlines, setEditedOutlines] = useState<SceneOutline[] | null>(null);
+  const [isConfirmingOutlines, setIsConfirmingOutlines] = useState(false);
+  const [commandError, setCommandError] = useState<string | null>(null);
+  // This page's confirmation lost to one made elsewhere: its edits stay shown.
+  const [confirmConflict, setConfirmConflict] = useState(false);
+  // The seq of a step Retry: the run shows as retrying until a step starts after it.
+  const [retrySeq, setRetrySeq] = useState<number | null>(null);
+  const [isRetrying, setIsRetrying] = useState(false);
   const [showAgentReveal, setShowAgentReveal] = useState(false);
-  const [generatedAgents, setGeneratedAgents] = useState<
-    Array<{
-      id: string;
-      name: string;
-      role: string;
-      persona: string;
-      avatar: string;
-      color: string;
-      priority: number;
-    }>
-  >([]);
-  const agentRevealResolveRef = useRef<(() => void) | null>(null);
+  // The agent cards were shown and are still being revealed: the classroom
+  // waits for them, as generation did.
+  const [agentRevealPending, setAgentRevealPending] = useState(false);
+  const agentRevealShownRef = useRef(false);
+  // Whether this page has caught up with the run yet.
+  const attachedRef = useRef(false);
+  const reviewOutlineEnabled = useSettingsStore((s) => s.reviewOutlineEnabled);
+  const setReviewOutlineEnabled = useSettingsStore((s) => s.setReviewOutlineEnabled);
 
-  // Compute active steps based on session state
-  const activeSteps = getActiveSteps(session);
-
-  // Load session from sessionStorage
   useEffect(() => {
-    cleanupOldImages(24).catch((e) => log.error(e));
+    if (runId) outlineReviewIntentRef.current = readReviewIntent(runId);
+  }, [runId]);
 
-    const saved = sessionStorage.getItem('generationSession');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved) as GenerationSessionState;
-        setSession(parsed);
-      } catch (e) {
-        log.error('Failed to parse generation session:', e);
-      }
-    }
-    setSessionLoaded(true);
-  }, []);
+  const steps = useMemo(() => {
+    if (!view) return [];
+    const ids = previewStepIds({
+      webSearch: !!capabilities.webSearch,
+      autoAgents: view.input.agents.mode === 'auto',
+    });
+    return ids.map((id) => ALL_STEPS.find((step) => step.id === id)!);
+  }, [view, capabilities.webSearch]);
+  const currentStepIndex = view
+    ? previewStepIndex(
+        view,
+        steps.map((step) => step.id),
+      )
+    : 0;
 
-  // Abort all in-flight requests on unmount
-  useEffect(() => {
-    return () => {
-      abortControllerRef.current?.abort();
-    };
-  }, []);
+  const outlines = view ? visibleOutlines(view) : [];
+  const isOutlineStreaming =
+    !!view && (view.state === 'preparing' || view.state === 'outlining') && !view.outline;
+  // The run confirms its own outline at its deadline unless the learner holds it.
+  const outlineCountdown = view?.input.outlineReview === 'countdown';
 
-  // Get API credentials from localStorage
-  const getApiHeaders = () => {
-    const modelConfig = getCurrentModelConfig();
-    const settings = useSettingsStore.getState();
-    const imageProviderConfig = settings.imageProvidersConfig?.[settings.imageProviderId];
-    const videoProviderConfig = settings.videoProvidersConfig?.[settings.videoProviderId];
-    return {
-      'Content-Type': 'application/json',
-      'x-model': modelConfig.modelString,
-      'x-api-key': modelConfig.apiKey,
-      'x-base-url': modelConfig.baseUrl,
-      'x-provider-type': modelConfig.providerType || '',
-      // Image generation provider
-      'x-image-provider': settings.imageProviderId || '',
-      'x-image-model': settings.imageModelId || '',
-      'x-image-api-key': imageProviderConfig?.apiKey || '',
-      'x-image-base-url': imageProviderConfig?.baseUrl || '',
-      // Video generation provider
-      'x-video-provider': settings.videoProviderId || '',
-      'x-video-model': settings.videoModelId || '',
-      'x-video-api-key': videoProviderConfig?.apiKey || '',
-      'x-video-base-url': videoProviderConfig?.baseUrl || '',
-      // Media generation toggles
-      'x-image-generation-enabled': String(settings.imageGenerationEnabled ?? false),
-      'x-video-generation-enabled': String(settings.videoGenerationEnabled ?? false),
-    };
-  };
-
-  // Auto-start generation when session is loaded
-  useEffect(() => {
-    if (session && !hasStartedRef.current) {
-      hasStartedRef.current = true;
-      startGeneration();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [session]);
-
-  // Main generation flow
-  const startGeneration = async () => {
-    if (!session) return;
-
-    // Create AbortController for this generation run
-    abortControllerRef.current?.abort();
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-    const signal = controller.signal;
-
-    // Use a local mutable copy so we can update it after PDF parsing
-    let currentSession = session;
-
-    setError(null);
-    setCurrentStepIndex(0);
-
+  const sendConfirm = async (edits: SceneOutline[] | null) => {
+    if (!view?.outline) return;
+    setIsConfirmingOutlines(true);
+    setCommandError(null);
     try {
-      // Compute active steps for this session (recomputed after session mutations)
-      let activeSteps = getActiveSteps(currentSession);
-
-      // Determine if we need the PDF analysis step
-      const hasPdfToAnalyze = !!currentSession.pdfStorageKey && !currentSession.pdfText;
-      // If no PDF to analyze, skip to the next available step
-      if (!hasPdfToAnalyze) {
-        const firstNonPdfIdx = activeSteps.findIndex((s) => s.id !== 'pdf-analysis');
-        setCurrentStepIndex(Math.max(0, firstNonPdfIdx));
-      }
-
-      // Step 0: Parse PDF if needed
-      if (hasPdfToAnalyze) {
-        log.debug('=== Generation Preview: Parsing PDF ===');
-        const pdfBlob = await loadPdfBlob(currentSession.pdfStorageKey!);
-        if (!pdfBlob) {
-          throw new Error(t('generation.pdfLoadFailed'));
+      await confirmOutline(view, edits ?? undefined);
+      outlineReviewIntentRef.current = false;
+      writeReviewIntent(view.runId, false);
+      setPhase('progress');
+      void refresh();
+    } catch (error) {
+      log.warn('Confirming the outline failed:', error);
+      if (error instanceof RunApiError && error.errorCode === 'RUN_STATE_CONFLICT') {
+        // Confirmed (or changed) elsewhere: what the learner edited here stays
+        // in view, with what happened.
+        if (edits) {
+          setConfirmConflict(true);
+          setPhase('review');
+          setCommandError(t('generation.outlineConfirmedElsewhere'));
         }
-
-        // Ensure pdfBlob is a valid Blob with content
-        if (!(pdfBlob instanceof Blob) || pdfBlob.size === 0) {
-          log.error('Invalid PDF blob:', {
-            type: typeof pdfBlob,
-            size: pdfBlob instanceof Blob ? pdfBlob.size : 'N/A',
-          });
-          throw new Error(t('generation.pdfLoadFailed'));
-        }
-
-        // Wrap as a File to guarantee multipart/form-data with correct content-type
-        const pdfFile = new File([pdfBlob], currentSession.pdfFileName || 'document.pdf', {
-          type: 'application/pdf',
-        });
-
-        const parseFormData = new FormData();
-        parseFormData.append('pdf', pdfFile);
-
-        if (currentSession.pdfProviderId) {
-          parseFormData.append('providerId', currentSession.pdfProviderId);
-        }
-        if (currentSession.pdfProviderConfig?.apiKey?.trim()) {
-          parseFormData.append('apiKey', currentSession.pdfProviderConfig.apiKey);
-        }
-        if (currentSession.pdfProviderConfig?.baseUrl?.trim()) {
-          parseFormData.append('baseUrl', currentSession.pdfProviderConfig.baseUrl);
-        }
-
-        const parseResponse = await fetch('/api/parse-pdf', {
-          method: 'POST',
-          body: parseFormData,
-          signal,
-        });
-
-        if (!parseResponse.ok) {
-          const errorData = await parseResponse.json();
-          throw new Error(errorData.error || t('generation.pdfParseFailed'));
-        }
-
-        const parseResult = await parseResponse.json();
-        if (!parseResult.success || !parseResult.data) {
-          throw new Error(t('generation.pdfParseFailed'));
-        }
-
-        let pdfText = parseResult.data.text as string;
-
-        // Truncate if needed
-        if (pdfText.length > MAX_PDF_CONTENT_CHARS) {
-          pdfText = pdfText.substring(0, MAX_PDF_CONTENT_CHARS);
-        }
-
-        // Create image metadata and store images
-        // Prefer metadata.pdfImages (both parsers now return this)
-        const rawPdfImages = parseResult.data.metadata?.pdfImages;
-        const images = rawPdfImages
-          ? rawPdfImages.map(
-              (img: {
-                id: string;
-                src?: string;
-                pageNumber?: number;
-                description?: string;
-                width?: number;
-                height?: number;
-              }) => ({
-                id: img.id,
-                src: img.src || '',
-                pageNumber: img.pageNumber || 1,
-                description: img.description,
-                width: img.width,
-                height: img.height,
-              }),
-            )
-          : (parseResult.data.images as string[]).map((src: string, i: number) => ({
-              id: `img_${i + 1}`,
-              src,
-              pageNumber: 1,
-            }));
-
-        const imageStorageIds = await storeImages(images);
-
-        const pdfImages: PdfImage[] = images.map(
-          (
-            img: {
-              id: string;
-              src: string;
-              pageNumber: number;
-              description?: string;
-              width?: number;
-              height?: number;
-            },
-            i: number,
-          ) => ({
-            id: img.id,
-            src: '',
-            pageNumber: img.pageNumber,
-            description: img.description,
-            width: img.width,
-            height: img.height,
-            storageId: imageStorageIds[i],
-          }),
-        );
-
-        // Update session with parsed PDF data
-        const updatedSession = {
-          ...currentSession,
-          pdfText,
-          pdfImages,
-          imageStorageIds,
-          pdfStorageKey: undefined, // Clear so we don't re-parse
-        };
-        setSession(updatedSession);
-        sessionStorage.setItem('generationSession', JSON.stringify(updatedSession));
-
-        // Truncation warnings
-        const warnings: string[] = [];
-        if ((parseResult.data.text as string).length > MAX_PDF_CONTENT_CHARS) {
-          warnings.push(t('generation.textTruncated', { n: MAX_PDF_CONTENT_CHARS }));
-        }
-        if (images.length > MAX_VISION_IMAGES) {
-          warnings.push(
-            t('generation.imageTruncated', { total: images.length, max: MAX_VISION_IMAGES }),
-          );
-        }
-        if (warnings.length > 0) {
-          setTruncationWarnings(warnings);
-        }
-
-        // Reassign local reference for subsequent steps
-        currentSession = updatedSession;
-        activeSteps = getActiveSteps(currentSession);
-      }
-
-      // Step: Web Search (if enabled)
-      const webSearchStepIdx = activeSteps.findIndex((s) => s.id === 'web-search');
-      if (currentSession.requirements.webSearch && webSearchStepIdx >= 0) {
-        setCurrentStepIndex(webSearchStepIdx);
-        setWebSearchSources([]);
-
-        const wsSettings = useSettingsStore.getState();
-        const wsApiKey =
-          wsSettings.webSearchProvidersConfig?.[wsSettings.webSearchProviderId]?.apiKey;
-        const res = await fetch('/api/web-search', {
-          method: 'POST',
-          headers: getApiHeaders(),
-          body: JSON.stringify({
-            query: currentSession.requirements.requirement,
-            pdfText: currentSession.pdfText || undefined,
-            apiKey: wsApiKey || undefined,
-          }),
-          signal,
-        });
-
-        if (!res.ok) {
-          const data = await res.json().catch(() => ({ error: 'Web search failed' }));
-          throw new Error(data.error || t('generation.webSearchFailed'));
-        }
-
-        const searchData = await res.json();
-        const sources = (searchData.sources || []).map((s: { title: string; url: string }) => ({
-          title: s.title,
-          url: s.url,
-        }));
-        setWebSearchSources(sources);
-
-        const updatedSessionWithSearch = {
-          ...currentSession,
-          researchContext: searchData.context || '',
-          researchSources: sources,
-        };
-        setSession(updatedSessionWithSearch);
-        sessionStorage.setItem('generationSession', JSON.stringify(updatedSessionWithSearch));
-        currentSession = updatedSessionWithSearch;
-        activeSteps = getActiveSteps(currentSession);
-      }
-
-      // Load imageMapping early (needed for both outline and scene generation)
-      let imageMapping: ImageMapping = {};
-      if (currentSession.imageStorageIds && currentSession.imageStorageIds.length > 0) {
-        log.debug('Loading images from IndexedDB');
-        imageMapping = await loadImageMapping(currentSession.imageStorageIds);
-      } else if (
-        currentSession.imageMapping &&
-        Object.keys(currentSession.imageMapping).length > 0
-      ) {
-        log.debug('Using imageMapping from session (old format)');
-        imageMapping = currentSession.imageMapping;
-      }
-
-      // Create stage client-side
-      const stageId = nanoid(10);
-      const stage: Stage = {
-        id: stageId,
-        name: extractTopicFromRequirement(currentSession.requirements.requirement),
-        description: '',
-        style: 'professional',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        interactiveMode: !!currentSession.requirements.interactiveMode,
-      };
-
-      // ── Generate outlines first (infers languageDirective) ──
-      let outlines = currentSession.sceneOutlines;
-      let languageDirective: string | undefined;
-
-      const outlineStepIdx = activeSteps.findIndex((s) => s.id === 'outline');
-      setCurrentStepIndex(outlineStepIdx >= 0 ? outlineStepIdx : 0);
-      if (!outlines || outlines.length === 0) {
-        log.debug('=== Generating outlines (SSE) ===');
-        setStreamingOutlines([]);
-
-        const outlineResult = await new Promise<{
-          outlines: SceneOutline[];
-          languageDirective: string;
-        }>((resolve, reject) => {
-          const collected: SceneOutline[] = [];
-          let directive: string | undefined;
-
-          fetch('/api/generate/scene-outlines-stream', {
-            method: 'POST',
-            headers: getApiHeaders(),
-            body: JSON.stringify({
-              requirements: currentSession.requirements,
-              pdfText: currentSession.pdfText,
-              pdfImages: currentSession.pdfImages,
-              imageMapping,
-              researchContext: currentSession.researchContext,
-            }),
-            signal,
-          })
-            .then((res) => {
-              if (!res.ok) {
-                return res.json().then((d) => {
-                  reject(new Error(d.error || t('generation.outlineGenerateFailed')));
-                });
-              }
-
-              const reader = res.body?.getReader();
-              if (!reader) {
-                reject(new Error(t('generation.streamNotReadable')));
-                return;
-              }
-
-              const decoder = new TextDecoder();
-              let sseBuffer = '';
-
-              const pump = (): Promise<void> =>
-                reader.read().then(({ done, value }) => {
-                  if (value) {
-                    sseBuffer += decoder.decode(value, { stream: !done });
-                    const lines = sseBuffer.split('\n');
-                    sseBuffer = lines.pop() || '';
-
-                    for (const line of lines) {
-                      if (!line.startsWith('data: ')) continue;
-                      try {
-                        const evt = JSON.parse(line.slice(6));
-                        if (evt.type === 'languageDirective') {
-                          directive = evt.data;
-                        } else if (evt.type === 'outline') {
-                          collected.push(evt.data);
-                          setStreamingOutlines([...collected]);
-                        } else if (evt.type === 'retry') {
-                          collected.length = 0;
-                          setStreamingOutlines([]);
-                          setStatusMessage(t('generation.outlineRetrying'));
-                        } else if (evt.type === 'done') {
-                          directive = evt.languageDirective || directive;
-                          resolve({
-                            outlines: evt.outlines || collected,
-                            languageDirective:
-                              directive ||
-                              'Teach in the language that matches the user requirement.',
-                          });
-                          return;
-                        } else if (evt.type === 'error') {
-                          reject(new Error(evt.error));
-                          return;
-                        }
-                      } catch (e) {
-                        log.error('Failed to parse outline SSE:', line, e);
-                      }
-                    }
-                  }
-                  if (done) {
-                    if (collected.length > 0) {
-                      resolve({
-                        outlines: collected,
-                        languageDirective:
-                          directive || 'Teach in the language that matches the user requirement.',
-                      });
-                    } else {
-                      reject(new Error(t('generation.outlineEmptyResponse')));
-                    }
-                    return;
-                  }
-                  return pump();
-                });
-
-              pump().catch(reject);
-            })
-            .catch(reject);
-        });
-
-        outlines = outlineResult.outlines;
-        languageDirective = outlineResult.languageDirective;
-
-        // Store languageDirective on the stage
-        stage.languageDirective = languageDirective;
-
-        const updatedSession = {
-          ...currentSession,
-          sceneOutlines: outlines,
-          languageDirective,
-        };
-        setSession(updatedSession);
-        sessionStorage.setItem('generationSession', JSON.stringify(updatedSession));
-
-        // Outline generation succeeded — clear homepage draft cache
-        try {
-          localStorage.removeItem('requirementDraft');
-        } catch {
-          /* ignore */
-        }
-
-        // Brief pause to let user see the final outline state
-        await new Promise((resolve) => setTimeout(resolve, 800));
-      }
-
-      // ── Agent generation (after outlines — uses languageDirective + outlines) ──
-      const settings = useSettingsStore.getState();
-      let agents: Array<{
-        id: string;
-        name: string;
-        role: string;
-        persona?: string;
-      }> = [];
-
-      if (settings.agentMode === 'auto') {
-        const agentStepIdx = activeSteps.findIndex((s) => s.id === 'agent-generation');
-        if (agentStepIdx >= 0) setCurrentStepIndex(agentStepIdx);
-
-        try {
-          const allAvatars = [
-            {
-              path: '/avatars/teacher.png',
-              desc: 'Male teacher with glasses, holding a book, green background',
-            },
-            {
-              path: '/avatars/teacher-2.png',
-              desc: 'Female teacher with long dark hair, blue traditional outfit, gentle expression',
-            },
-            {
-              path: '/avatars/assist.png',
-              desc: 'Young female assistant with glasses, pink background, friendly smile',
-            },
-            {
-              path: '/avatars/assist-2.png',
-              desc: 'Young female in orange top and purple overalls, cheerful and approachable',
-            },
-            {
-              path: '/avatars/clown.png',
-              desc: 'Energetic girl with glasses pointing up, green shirt, lively and fun',
-            },
-            {
-              path: '/avatars/clown-2.png',
-              desc: 'Playful girl with curly hair doing rock gesture, blue shirt, humorous vibe',
-            },
-            {
-              path: '/avatars/curious.png',
-              desc: 'Surprised boy with glasses, hand on cheek, curious expression',
-            },
-            {
-              path: '/avatars/curious-2.png',
-              desc: 'Boy with backpack holding a book and question mark bubble, inquisitive',
-            },
-            {
-              path: '/avatars/note-taker.png',
-              desc: 'Studious boy with glasses, blue shirt, calm and organized',
-            },
-            {
-              path: '/avatars/note-taker-2.png',
-              desc: 'Active boy with yellow backpack waving, blue outfit, enthusiastic learner',
-            },
-            {
-              path: '/avatars/thinker.png',
-              desc: 'Thoughtful girl with hand on chin, purple background, contemplative',
-            },
-            {
-              path: '/avatars/thinker-2.png',
-              desc: 'Girl reading a book intently, long dark hair, intellectual and focused',
-            },
-          ];
-
-          const getAvailableVoicesForGeneration = () => {
-            const providers = getAvailableProvidersWithVoices(settings.ttsProvidersConfig);
-            return providers.flatMap((p) =>
-              p.voices.map((v) => ({
-                providerId: p.providerId,
-                voiceId: v.id,
-                voiceName: v.name,
-              })),
-            );
-          };
-
-          const agentResp = await fetch('/api/generate/agent-profiles', {
-            method: 'POST',
-            headers: getApiHeaders(),
-            body: JSON.stringify({
-              stageInfo: { name: stage.name, description: stage.description },
-              sceneOutlines: outlines.map((o) => ({ title: o.title, description: o.description })),
-              languageDirective,
-              availableAvatars: allAvatars.map((a) => a.path),
-              avatarDescriptions: allAvatars.map((a) => ({ path: a.path, desc: a.desc })),
-              availableVoices: getAvailableVoicesForGeneration(),
-            }),
-            signal,
-          });
-
-          if (!agentResp.ok) throw new Error('Agent generation failed');
-          const agentData = await agentResp.json();
-          if (!agentData.success) throw new Error(agentData.error || 'Agent generation failed');
-
-          // Save to IndexedDB and registry
-          const { saveGeneratedAgents } = await import('@/lib/orchestration/registry/store');
-          const savedIds = await saveGeneratedAgents(stage.id, agentData.agents);
-          settings.setSelectedAgentIds(savedIds);
-          stage.agentIds = savedIds;
-
-          // Show card-reveal modal, continue generation once all cards are revealed
-          setGeneratedAgents(agentData.agents);
-          setShowAgentReveal(true);
-          await new Promise<void>((resolve) => {
-            agentRevealResolveRef.current = resolve;
-          });
-
-          agents = savedIds
-            .map((id) => useAgentRegistry.getState().getAgent(id))
-            .filter(Boolean)
-            .map((a) => ({
-              id: a!.id,
-              name: a!.name,
-              role: a!.role,
-              persona: a!.persona,
-            }));
-        } catch (err: unknown) {
-          log.warn('[Generation] Agent generation failed, falling back to presets:', err);
-          const registry = useAgentRegistry.getState();
-          const fallbackIds = settings.selectedAgentIds.filter((id) => {
-            const a = registry.getAgent(id);
-            return a && !a.isGenerated;
-          });
-          agents = fallbackIds
-            .map((id) => registry.getAgent(id))
-            .filter(Boolean)
-            .map((a) => ({
-              id: a!.id,
-              name: a!.name,
-              role: a!.role,
-              persona: a!.persona,
-            }));
-          stage.agentIds = fallbackIds;
-        }
+        await refresh();
+      } else if (error instanceof RunApiError) {
+        setCommandError(runApiErrorText(error, t));
       } else {
-        // Preset mode — use selected agents (include persona)
-        // Filter out stale generated agent IDs that may linger in settings
-        const registry = useAgentRegistry.getState();
-        const presetAgentIds = settings.selectedAgentIds.filter((id) => {
-          const a = registry.getAgent(id);
-          return a && !a.isGenerated;
-        });
-        agents = presetAgentIds
-          .map((id) => registry.getAgent(id))
-          .filter(Boolean)
-          .map((a) => ({
-            id: a!.id,
-            name: a!.name,
-            role: a!.role,
-            persona: a!.persona,
-          }));
-        stage.agentIds = presetAgentIds;
+        setCommandError(error instanceof Error ? error.message : String(error));
       }
+    } finally {
+      setIsConfirmingOutlines(false);
+    }
+  };
+  // A run that waits for its outline shows the review once the outline is
+  // ready, in whichever tab or page shows it, until the learner confirms it.
+  useEffect(() => {
+    if (!view || !caughtUp) return;
+    const firstAttach = !attachedRef.current;
+    attachedRef.current = true;
+    const next = nextPreviewPhase({
+      phase,
+      state: view.state,
+      outlineReview: view.input.outlineReview,
+      outlineStreaming: isOutlineStreaming,
+      hasOutline: !!view.outline,
+      firstAttach,
+      reviewIntent: outlineReviewIntentRef.current,
+      confirmConflict,
+    });
+    if (next !== phase) setPhase(next);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view?.state, caughtUp]);
 
-      // Move to scene generation step
-      setStatusMessage('');
-      if (!outlines || outlines.length === 0) {
-        throw new Error(t('generation.outlineEmptyResponse'));
+  // The generated roster's cards, revealed as generation goes on.
+  useEffect(() => {
+    if (!view?.generatedAgents || agentRevealShownRef.current) return;
+    if (view.input.agents.mode !== 'auto' || view.stageId) return;
+    agentRevealShownRef.current = true;
+    setAgentRevealPending(true);
+    setShowAgentReveal(true);
+  }, [view?.generatedAgents, view?.input.agents.mode, view?.stageId]);
+
+  // The first scene is in the course: the classroom takes over.
+  // A confirmation that lost to another tab keeps its edits on screen until
+  // the learner acknowledges it.
+  useEffect(() => {
+    if (!view?.stageId || agentRevealPending || confirmConflict) return;
+    if (view.state === 'ended') return;
+    router.replace(`/classroom/${encodeURIComponent(view.stageId)}`);
+  }, [view?.stageId, view?.state, agentRevealPending, confirmConflict, router]);
+
+  // A Retry is queued until a step starts after it (a media item in flight
+  // finishes first).
+  const retryQueued =
+    !!view && retrySeq !== null && view.state !== 'paused' && view.stepStartedSeq <= retrySeq;
+
+  const handleRetry = async () => {
+    if (!view || isRetrying) return;
+    setIsRetrying(true);
+    setCommandError(null);
+    try {
+      setRetrySeq(await retryPausedRun(view));
+      void refresh();
+    } catch (error) {
+      log.warn('Retrying the run failed:', error);
+      if (error instanceof RunApiError && error.errorCode === 'RUN_STATE_CONFLICT') {
+        // Retried (or changed) elsewhere.
+        toast.info(t('generation.runChangedElsewhere'));
+        await refresh();
+      } else if (error instanceof RunApiError) {
+        setCommandError(runApiErrorText(error, t));
+      } else {
+        setCommandError(error instanceof Error ? error.message : String(error));
       }
-
-      // Store stage and outlines
-      const store = useStageStore.getState();
-      store.setStage(stage);
-      store.setOutlines(outlines);
-
-      // Advance to slide-content step
-      const contentStepIdx = activeSteps.findIndex((s) => s.id === 'slide-content');
-      if (contentStepIdx >= 0) setCurrentStepIndex(contentStepIdx);
-
-      // Build stageInfo and userProfile for API call
-      const stageInfo = {
-        name: stage.name,
-        description: stage.description,
-        style: stage.style,
-      };
-
-      const userProfile =
-        currentSession.requirements.userNickname || currentSession.requirements.userBio
-          ? `Student: ${currentSession.requirements.userNickname || 'Unknown'}${currentSession.requirements.userBio ? ` — ${currentSession.requirements.userBio}` : ''}`
-          : undefined;
-
-      // Generate ONLY the first scene
-      store.setGeneratingOutlines(outlines);
-
-      const firstOutline = outlines[0];
-
-      // Step 2: Generate content (currentStepIndex is already 2)
-      const contentResp = await fetch('/api/generate/scene-content', {
-        method: 'POST',
-        headers: getApiHeaders(),
-        body: JSON.stringify({
-          outline: firstOutline,
-          allOutlines: outlines,
-          pdfImages: currentSession.pdfImages,
-          imageMapping,
-          stageInfo,
-          stageId: stage.id,
-          agents,
-          languageDirective,
-        }),
-        signal,
-      });
-
-      if (!contentResp.ok) {
-        const errorData = await contentResp.json().catch(() => ({ error: 'Request failed' }));
-        throw new Error(errorData.error || t('generation.sceneGenerateFailed'));
-      }
-
-      const contentData = await contentResp.json();
-      if (!contentData.success || !contentData.content) {
-        throw new Error(contentData.error || t('generation.sceneGenerateFailed'));
-      }
-
-      // Generate actions (activate actions step indicator)
-      const actionsStepIdx = activeSteps.findIndex((s) => s.id === 'actions');
-      setCurrentStepIndex(actionsStepIdx >= 0 ? actionsStepIdx : currentStepIndex + 1);
-
-      const actionsResp = await fetch('/api/generate/scene-actions', {
-        method: 'POST',
-        headers: getApiHeaders(),
-        body: JSON.stringify({
-          outline: contentData.effectiveOutline || firstOutline,
-          allOutlines: outlines,
-          content: contentData.content,
-          stageId: stage.id,
-          agents,
-          previousSpeeches: [],
-          userProfile,
-          languageDirective,
-        }),
-        signal,
-      });
-
-      if (!actionsResp.ok) {
-        const errorData = await actionsResp.json().catch(() => ({ error: 'Request failed' }));
-        throw new Error(errorData.error || t('generation.sceneGenerateFailed'));
-      }
-
-      const data = await actionsResp.json();
-      if (!data.success || !data.scene) {
-        throw new Error(data.error || t('generation.sceneGenerateFailed'));
-      }
-
-      // Generate TTS for first scene (part of actions step — blocking)
-      if (settings.ttsEnabled && settings.ttsProviderId !== 'browser-native-tts') {
-        const ttsProviderConfig = settings.ttsProvidersConfig?.[settings.ttsProviderId];
-        const speechActions = (data.scene.actions || []).filter(
-          (a: { type: string; text?: string }) => a.type === 'speech' && a.text,
-        );
-
-        let ttsFailCount = 0;
-        for (const action of speechActions) {
-          const audioId = `tts_${action.id}`;
-          action.audioId = audioId;
-          try {
-            const resp = await fetch('/api/generate/tts', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                text: action.text,
-                audioId,
-                ttsProviderId: settings.ttsProviderId,
-                ttsModelId: ttsProviderConfig?.modelId,
-                ttsVoice: settings.ttsVoice,
-                ttsSpeed: settings.ttsSpeed,
-                ttsApiKey: ttsProviderConfig?.apiKey || undefined,
-                ttsBaseUrl:
-                  ttsProviderConfig?.baseUrl ||
-                  ttsProviderConfig?.customDefaultBaseUrl ||
-                  undefined,
-              }),
-              signal,
-            });
-            if (!resp.ok) {
-              ttsFailCount++;
-              continue;
-            }
-            const ttsData = await resp.json();
-            if (!ttsData.success) {
-              ttsFailCount++;
-              continue;
-            }
-            const binary = atob(ttsData.base64);
-            const bytes = new Uint8Array(binary.length);
-            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-            const blob = new Blob([bytes], { type: `audio/${ttsData.format}` });
-            await db.audioFiles.put({
-              id: audioId,
-              blob,
-              format: ttsData.format,
-              createdAt: Date.now(),
-            });
-          } catch (err) {
-            log.warn(`[TTS] Failed for ${audioId}:`, err);
-            ttsFailCount++;
-          }
-        }
-
-        if (ttsFailCount > 0 && speechActions.length > 0) {
-          throw new Error(t('generation.speechFailed'));
-        }
-      }
-
-      // Add scene to store and navigate
-      store.addScene(data.scene);
-      store.setCurrentSceneId(data.scene.id);
-
-      // Set remaining outlines as skeleton placeholders
-      const remaining = outlines.filter((o) => o.order !== data.scene.order);
-      store.setGeneratingOutlines(remaining);
-
-      // Store generation params for classroom to continue generation
-      sessionStorage.setItem(
-        'generationParams',
-        JSON.stringify({
-          pdfImages: currentSession.pdfImages,
-          agents,
-          userProfile,
-          languageDirective,
-        }),
-      );
-
-      sessionStorage.removeItem('generationSession');
-      await store.saveToStorage();
-      router.push(`/classroom/${stage.id}`);
-    } catch (err) {
-      // AbortError is expected when navigating away — don't show as error
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        log.info('[GenerationPreview] Generation aborted');
-        return;
-      }
-      sessionStorage.removeItem('generationSession');
-      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsRetrying(false);
     }
   };
 
-  const extractTopicFromRequirement = (requirement: string): string => {
-    const trimmed = requirement.trim();
-    if (trimmed.length <= 500) {
-      return trimmed;
-    }
-    return trimmed.substring(0, 500).trim() + '...';
-  };
-
+  // Leaving does not stop the run: its course card goes on showing it.
   const goBackToHome = () => {
-    abortControllerRef.current?.abort();
-    sessionStorage.removeItem('generationSession');
     router.push('/');
   };
 
-  // Still loading session from sessionStorage
-  if (!sessionLoaded) {
+  // Triggered when the user clicks the outline card, mid-stream or on the
+  // outline-ready card. A run that would confirm its outline itself is held
+  // first: it then waits for the learner's confirmation.
+  const handleExpandStreamingOutline = () => {
+    if (!view) return;
+    outlineReviewIntentRef.current = true;
+    writeReviewIntent(view.runId, true);
+    setPhase('review');
+    if (!outlineCountdown) return;
+    void holdOutline(view).catch(async (error) => {
+      log.warn('Holding the outline failed:', error);
+      if (error instanceof RunApiError && error.errorCode === 'RUN_STATE_CONFLICT') {
+        // The run already went on with its outline: the review says so, and
+        // its button follows the run.
+        setConfirmConflict(true);
+        setPhase('review');
+        setCommandError(t('generation.outlineAlreadyContinued'));
+        await refresh();
+      } else if (error instanceof RunApiError) {
+        setCommandError(runApiErrorText(error, t));
+      } else {
+        setCommandError(error instanceof Error ? error.message : String(error));
+      }
+    });
+  };
+
+  // Inverse of expand, while the outline streams: back to the streaming card.
+  // Once the outline is ready the run waits for the review, which stays open.
+  const handleCollapseEditor = () => {
+    if (!view) return;
+    outlineReviewIntentRef.current = false;
+    writeReviewIntent(view.runId, false);
+    setPhase('progress');
+  };
+
+  const handleOutlinesChange = (next: SceneOutline[]) => {
+    // The editor is read-only while the outline streams.
+    if (isOutlineStreaming) return;
+    setEditedOutlines(next);
+  };
+
+  const handleConfirmOutlines = () => {
+    // The outline was confirmed elsewhere: follow the run as it goes.
+    if (confirmConflict) {
+      setConfirmConflict(false);
+      setCommandError(null);
+      setPhase('progress');
+      return;
+    }
+    const finalOutlines = editedOutlines ?? outlines;
+    if (finalOutlines.length === 0) return;
+    void sendConfirm(editedOutlines);
+  };
+
+  // The run cannot be read now; the page keeps trying.
+  if (status === 'error' && runId) {
+    return (
+      <div className="min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 flex items-center justify-center p-4">
+        <Card className="p-8 max-w-md w-full">
+          <div className="text-center space-y-4">
+            <div className="size-8 border-2 border-muted-foreground border-t-transparent rounded-full animate-spin mx-auto" />
+            <h2 className="text-xl font-semibold">{t('generation.runLoadFailed')}</h2>
+            <p className="text-sm text-muted-foreground">{t('generation.runLoadRetrying')}</p>
+            <Button variant="outline" onClick={() => router.push('/')} className="w-full">
+              <ArrowLeft className="size-4 mr-2" />
+              {t('generation.backToHome')}
+            </Button>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  // Still reading the run
+  if (status === 'loading' && runId) {
     return (
       <div className="min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 flex items-center justify-center p-4">
         <div className="text-center text-muted-foreground">
@@ -850,8 +298,8 @@ function GenerationPreviewContent() {
     );
   }
 
-  // No session found
-  if (!session) {
+  // No run (or it was discarded)
+  if (!view || status === 'missing' || view.state === 'ended') {
     return (
       <div className="min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 flex items-center justify-center p-4">
         <Card className="p-8 max-w-md w-full">
@@ -869,10 +317,104 @@ function GenerationPreviewContent() {
     );
   }
 
+  const failureSentence = (text: FailureText) => ('key' in text ? t(text.key) : text.text);
+  const isReviewingOutlines = phase === 'review';
+  // The run confirms its outline itself unless the learner opens the review.
+  const isOutlineReady = phase === 'outline-ready';
+  const error =
+    commandError ??
+    (view.state === 'paused' && view.error ? failureSentence(runFailureText(view.error)) : null);
+  const paused = view.state === 'paused';
+  const statusMessage = view.outlineRetrying
+    ? t('generation.outlineRetrying')
+    : retryQueued
+      ? t('generation.retryingScene')
+      : isOutlineReady
+        ? t('generation.reviewOutlineAutoContinue')
+        : '';
+  const webSearchSources = view.researchSources;
+  const generatedAgents = view.generatedAgents ?? [];
+
   const activeStep =
-    activeSteps.length > 0
-      ? activeSteps[Math.min(currentStepIndex, activeSteps.length - 1)]
-      : ALL_STEPS[0];
+    steps.length > 0 ? steps[Math.min(currentStepIndex, steps.length - 1)] : ALL_STEPS[0];
+
+  if (isReviewingOutlines) {
+    const outlineStepIndex = Math.max(
+      0,
+      steps.findIndex((step) => step.id === 'outline'),
+    );
+    // Editor source-of-truth: the learner's edit; else the run's outline (the
+    // streamed items until it is ready).
+    const editorOutlines = editedOutlines ?? outlines;
+
+    return (
+      <div className="min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 flex flex-col items-center p-4 relative overflow-hidden">
+        <motion.div
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="absolute top-4 left-4 z-20"
+        >
+          <Button variant="ghost" size="sm" onClick={goBackToHome} disabled={isConfirmingOutlines}>
+            <ArrowLeft className="size-4 mr-2" />
+            {t('generation.backToHome')}
+          </Button>
+        </motion.div>
+
+        <div className="z-10 w-full max-w-3xl pt-16 pb-8">
+          <motion.div
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="space-y-6"
+          >
+            <div className="flex justify-center gap-2">
+              {steps.map((step, idx) => (
+                <div
+                  key={step.id}
+                  className={cn(
+                    'h-1.5 rounded-full transition-all duration-500',
+                    idx < outlineStepIndex
+                      ? 'w-1.5 bg-blue-500/30'
+                      : idx === outlineStepIndex
+                        ? 'w-8 bg-blue-500'
+                        : 'w-1.5 bg-muted/50',
+                  )}
+                />
+              ))}
+            </div>
+
+            <div className="max-w-2xl space-y-2 text-center mx-auto">
+              <h2 className="text-2xl font-bold tracking-tight">
+                {t('generation.reviewOutlineTitle')}
+              </h2>
+              <p className="text-muted-foreground text-sm md:text-base">
+                {isOutlineStreaming
+                  ? t('generation.reviewOutlineStreamingDesc')
+                  : t('generation.reviewOutlineDesc')}
+              </p>
+            </div>
+
+            {error && (
+              <div className="mx-auto max-w-2xl rounded-md border border-red-500/20 bg-red-500/10 px-4 py-3 text-sm text-red-600 dark:text-red-300">
+                {error}
+              </div>
+            )}
+
+            <OutlinesEditor
+              outlines={editorOutlines}
+              onChange={handleOutlinesChange}
+              onConfirm={handleConfirmOutlines}
+              onBack={goBackToHome}
+              alwaysReview={reviewOutlineEnabled}
+              onAlwaysReviewChange={setReviewOutlineEnabled}
+              isLoading={isConfirmingOutlines}
+              isStreaming={isOutlineStreaming}
+              onCollapse={isOutlineStreaming ? handleCollapseEditor : undefined}
+            />
+          </motion.div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 flex flex-col items-center justify-center p-4 relative overflow-hidden text-center">
@@ -910,7 +452,7 @@ function GenerationPreviewContent() {
           <Card className="relative overflow-hidden border-muted/40 shadow-2xl bg-white/80 dark:bg-slate-900/80 backdrop-blur-xl min-h-[400px] flex flex-col items-center justify-center p-8 md:p-12">
             {/* Progress Dots */}
             <div className="absolute top-6 left-0 right-0 flex justify-center gap-2">
-              {activeSteps.map((step, idx) => (
+              {steps.map((step, idx) => (
                 <div
                   key={step.id}
                   className={cn(
@@ -939,15 +481,6 @@ function GenerationPreviewContent() {
                     >
                       <AlertCircle className="size-16 text-red-500" />
                     </motion.div>
-                  ) : isComplete ? (
-                    <motion.div
-                      key="complete"
-                      initial={{ scale: 0.5, opacity: 0 }}
-                      animate={{ scale: 1, opacity: 1 }}
-                      className="size-32 rounded-full bg-green-500/10 flex items-center justify-center border-2 border-green-500/20"
-                    >
-                      <CheckCircle2 className="size-16 text-green-500" />
-                    </motion.div>
                   ) : (
                     <motion.div
                       key={activeStep.id}
@@ -959,8 +492,11 @@ function GenerationPreviewContent() {
                     >
                       <StepVisualizer
                         stepId={activeStep.id}
-                        outlines={streamingOutlines}
+                        outlines={outlines}
                         webSearchSources={webSearchSources}
+                        onExpandOutline={
+                          activeStep.id === 'outline' ? handleExpandStreamingOutline : undefined
+                        }
                       />
                     </motion.div>
                   )}
@@ -971,84 +507,19 @@ function GenerationPreviewContent() {
               <div className="space-y-3 max-w-sm mx-auto">
                 <AnimatePresence mode="wait">
                   <motion.div
-                    key={error ? 'error' : isComplete ? 'done' : activeStep.id}
+                    key={error ? 'error' : activeStep.id}
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
                     exit={{ opacity: 0, y: -10 }}
                     className="space-y-2"
                   >
                     <h2 className="text-2xl font-bold tracking-tight">
-                      {error
-                        ? t('generation.generationFailed')
-                        : isComplete
-                          ? t('generation.generationComplete')
-                          : t(activeStep.title)}
+                      {error ? t('generation.generationFailed') : t(activeStep.title)}
                     </h2>
                     <p className="text-muted-foreground text-base">
-                      {error
-                        ? error
-                        : isComplete
-                          ? t('generation.classroomReady')
-                          : statusMessage || t(activeStep.description)}
+                      {error ? error : statusMessage || t(activeStep.description)}
                     </p>
                   </motion.div>
-                </AnimatePresence>
-
-                {/* Truncation warning indicator */}
-                <AnimatePresence>
-                  {truncationWarnings.length > 0 && !error && !isComplete && (
-                    <motion.div
-                      initial={{ opacity: 0, scale: 0 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      exit={{ opacity: 0, scale: 0 }}
-                      transition={{
-                        type: 'spring',
-                        stiffness: 500,
-                        damping: 30,
-                      }}
-                      className="flex justify-center"
-                    >
-                      <Tooltip>
-                        <TooltipTrigger asChild>
-                          <motion.button
-                            type="button"
-                            animate={{
-                              boxShadow: [
-                                '0 0 0 0 rgba(251, 191, 36, 0), 0 0 0 0 rgba(251, 191, 36, 0)',
-                                '0 0 16px 4px rgba(251, 191, 36, 0.12), 0 0 4px 1px rgba(251, 191, 36, 0.08)',
-                                '0 0 0 0 rgba(251, 191, 36, 0), 0 0 0 0 rgba(251, 191, 36, 0)',
-                              ],
-                            }}
-                            transition={{
-                              duration: 3,
-                              repeat: Infinity,
-                              ease: 'easeInOut',
-                            }}
-                            className="relative size-7 rounded-full flex items-center justify-center cursor-default
-                                       bg-gradient-to-br from-amber-400/15 to-orange-400/10
-                                       border border-amber-400/25 hover:border-amber-400/40
-                                       hover:from-amber-400/20 hover:to-orange-400/15
-                                       transition-colors duration-300
-                                       focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-500/30"
-                          >
-                            <AlertTriangle
-                              className="size-3.5 text-amber-500 dark:text-amber-400"
-                              strokeWidth={2.5}
-                            />
-                          </motion.button>
-                        </TooltipTrigger>
-                        <TooltipContent side="bottom" sideOffset={6}>
-                          <div className="space-y-1 py-0.5">
-                            {truncationWarnings.map((w, i) => (
-                              <p key={i} className="text-xs leading-relaxed">
-                                {w}
-                              </p>
-                            ))}
-                          </div>
-                        </TooltipContent>
-                      </Tooltip>
-                    </motion.div>
-                  )}
                 </AnimatePresence>
               </div>
             </div>
@@ -1062,13 +533,25 @@ function GenerationPreviewContent() {
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="w-full max-w-xs"
+                className="flex w-full max-w-sm gap-3"
               >
-                <Button size="lg" variant="outline" className="w-full h-12" onClick={goBackToHome}>
-                  {t('generation.goBackAndRetry')}
+                {paused && (
+                  <Button
+                    size="lg"
+                    className="h-12 flex-1"
+                    onClick={handleRetry}
+                    disabled={isRetrying}
+                    data-testid="generation-retry"
+                  >
+                    <RefreshCw className={cn('size-4 mr-2', isRetrying && 'animate-spin')} />
+                    {t('generation.retryScene')}
+                  </Button>
+                )}
+                <Button size="lg" variant="outline" className="h-12 flex-1" onClick={goBackToHome}>
+                  {paused ? t('generation.backToHome') : t('generation.goBackAndRetry')}
                 </Button>
               </motion.div>
-            ) : !isComplete ? (
+            ) : !isOutlineReady ? (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}
@@ -1095,11 +578,11 @@ function GenerationPreviewContent() {
       <AgentRevealModal
         agents={generatedAgents}
         open={showAgentReveal}
-        onClose={() => setShowAgentReveal(false)}
-        onAllRevealed={() => {
-          agentRevealResolveRef.current?.();
-          agentRevealResolveRef.current = null;
+        onClose={() => {
+          setShowAgentReveal(false);
+          setAgentRevealPending(false);
         }}
+        onAllRevealed={() => setAgentRevealPending(false)}
       />
     </div>
   );

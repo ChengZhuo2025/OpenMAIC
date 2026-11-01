@@ -19,12 +19,17 @@
 
 import crypto from 'crypto';
 import type {
+  MediaProviderFetch,
   VideoGenerationConfig,
   VideoGenerationOptions,
   VideoGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import { probeAuth } from '../probe-auth';
+import { runPolledTask, type PolledTaskControl } from '../polled-task';
+import { assertNotRedirected } from '../redirect-guard';
+import { requireModel } from '../require-model';
 
-const DEFAULT_MODEL = 'kling-v2-6';
 const DEFAULT_BASE_URL = 'https://api-beijing.klingai.com';
 const POLL_INTERVAL_MS = 5_000;
 const MAX_POLL_ATTEMPTS = 120; // 10 minutes max
@@ -128,25 +133,27 @@ export async function testKlingConnectivity(
   config: VideoGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
+  // A malformed key is a local configuration error, reported as such before
+  // any request (the probe's transport failures are reported generically).
+  let token: string;
   try {
     const { accessKey, secretKey } = parseApiKey(config.apiKey);
-    const token = generateJWT(accessKey, secretKey);
-    // Use a GET to a non-existent task to validate auth
-    const response = await fetch(`${baseUrl}/v1/videos/text2video/connectivity-test`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (response.status === 401 || response.status === 403) {
-      const text = await response.text();
-      return {
-        success: false,
-        message: `Kling auth failed (${response.status}): ${text}`,
-      };
-    }
-    return { success: true, message: 'Connected to Kling' };
+    token = generateJWT(accessKey, secretKey);
   } catch (err) {
-    return { success: false, message: `Kling connectivity error: ${err}` };
+    return {
+      success: false,
+      message: `Kling connectivity error: ${err instanceof Error ? err.message : String(err)}`,
+    };
   }
+  return probeAuth({
+    providerName: 'Kling',
+    request: () =>
+      mediaFetchFor(config)(`${baseUrl}/v1/videos/text2video/connectivity-test`, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +161,7 @@ export async function testKlingConnectivity(
 // ---------------------------------------------------------------------------
 
 async function submitTask(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   token: string,
   model: string,
@@ -169,14 +177,17 @@ async function submitTask(
   if (options.duration) body.duration = String(options.duration);
   if (options.aspectRatio) body.aspect_ratio = options.aspectRatio;
 
-  const response = await fetch(`${baseUrl}/v1/videos/text2video`, {
+  const response = await fetchImpl(`${baseUrl}/v1/videos/text2video`, {
     method: 'POST',
+    redirect: 'manual',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(body),
   });
+
+  assertNotRedirected(response, 'Kling');
 
   if (!response.ok) {
     const text = await response.text();
@@ -199,14 +210,18 @@ async function submitTask(
 // ---------------------------------------------------------------------------
 
 async function pollTask(
+  fetchImpl: MediaProviderFetch,
   baseUrl: string,
   token: string,
   taskId: string,
 ): Promise<KlingPollResponse['data']> {
-  const response = await fetch(`${baseUrl}/v1/videos/text2video/${taskId}`, {
+  const response = await fetchImpl(`${baseUrl}/v1/videos/text2video/${taskId}`, {
     method: 'GET',
+    redirect: 'manual',
     headers: { Authorization: `Bearer ${token}` },
   });
+
+  assertNotRedirected(response, 'Kling');
 
   if (!response.ok) {
     const text = await response.text();
@@ -228,42 +243,52 @@ async function pollTask(
 export async function generateWithKling(
   config: VideoGenerationConfig,
   options: VideoGenerationOptions,
+  control?: PolledTaskControl,
 ): Promise<VideoGenerationResult> {
-  const model = config.model || DEFAULT_MODEL;
+  const model = requireModel(config.model, 'Kling');
   const baseUrl = config.baseUrl || DEFAULT_BASE_URL;
   const { accessKey, secretKey } = parseApiKey(config.apiKey);
   const token = generateJWT(accessKey, secretKey);
 
-  // 1. Submit
-  const taskId = await submitTask(baseUrl, token, model, options);
+  return runPolledTask<VideoGenerationResult>({
+    submit: async () => ({
+      status: 'submitted',
+      taskId: await submitTask(mediaFetchFor(config), baseUrl, token, model, options),
+    }),
+    poll: async (taskId) => {
+      const result = await pollTask(mediaFetchFor(config), baseUrl, token, taskId);
 
-  // 2. Poll until done
-  for (let attempt = 0; attempt < MAX_POLL_ATTEMPTS; attempt++) {
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-    const result = await pollTask(baseUrl, token, taskId);
-
-    if (result.task_status === 'succeed') {
-      const video = result.task_result?.videos?.[0];
-      if (!video?.url) {
-        throw new Error('Kling task succeeded but no video URL returned');
+      if (result.task_status === 'succeed') {
+        const video = result.task_result?.videos?.[0];
+        if (!video?.url) {
+          throw new Error('Kling task succeeded but no video URL returned');
+        }
+        const { width, height } = getDimensions(options.aspectRatio);
+        return {
+          status: 'done',
+          result: {
+            url: video.url,
+            duration: Number(video.duration) || options.duration || 5,
+            width,
+            height,
+          },
+        };
       }
-      const { width, height } = getDimensions(options.aspectRatio);
-      return {
-        url: video.url,
-        duration: Number(video.duration) || options.duration || 5,
-        width,
-        height,
-      };
-    }
 
-    if (result.task_status === 'failed') {
-      throw new Error(
-        `Kling video generation failed: ${result.task_status_msg || 'Unknown error'}`,
-      );
-    }
-  }
+      if (result.task_status === 'failed') {
+        return {
+          status: 'failed',
+          message: `Kling video generation failed: ${result.task_status_msg || 'Unknown error'}`,
+        };
+      }
 
-  throw new Error(
-    `Kling video generation timed out after ${(MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS) / 1000}s (task: ${taskId})`,
-  );
+      return { status: 'pending' };
+    },
+    intervalMs: POLL_INTERVAL_MS,
+    maxAttempts: MAX_POLL_ATTEMPTS,
+    label: 'Kling video generation',
+    control,
+    formatTimeout: ({ taskId, elapsedMs }) =>
+      `Kling video generation timed out after ${elapsedMs / 1000}s (task: ${taskId})`,
+  });
 }

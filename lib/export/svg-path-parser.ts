@@ -1,5 +1,9 @@
+import { validateSvgPath, RENDER_PATH_LIMITS } from '@openmaic/geometry';
 import { SVGPathData } from 'svg-pathdata';
 import arcToBezier from 'svg-arc-to-cubic-bezier';
+import { createLogger } from '@/lib/logger';
+
+const log = createLogger('SvgPathParser');
 
 const typeMap = {
   1: 'Z',
@@ -19,7 +23,9 @@ const typeMap = {
  * @param d SVG path d属性
  */
 export const parseSvgPath = (d: string) => {
-  const pathData = new SVGPathData(d);
+  const validation = validateSvgPath(d, RENDER_PATH_LIMITS);
+  if (!validation.ok) throw new Error(`${validation.error.field}: ${validation.error.message}`);
+  const pathData = new SVGPathData(validation.commands);
 
   const ret = pathData.commands.map((item) => {
     return { ...item, type: typeMap[item.type] };
@@ -32,9 +38,25 @@ export type SvgPath = ReturnType<typeof parseSvgPath>;
 /**
  * 解析SVG路径，并将圆弧（A）类型的路径转为三次贝塞尔（C）类型的路径
  * @param d SVG path d属性
+ *
+ * Returns an empty array if the path is malformed (e.g. unrecognised commands).
+ * Mirrors the defensive behaviour of {@link getSvgPathRange}: a single bad path
+ * (often produced by upstream LLM hallucinations) shouldn't take down the whole
+ * PPTX export.
  */
 export const toPoints = (d: string) => {
-  const pathData = new SVGPathData(d);
+  let pathData: SVGPathData;
+  try {
+    const validation = validateSvgPath(d, RENDER_PATH_LIMITS);
+    if (!validation.ok) {
+      log.warn('Invalid SVG path:', validation.error);
+      return [];
+    }
+    pathData = new SVGPathData(validation.commands);
+  } catch (err) {
+    log.warn('Failed to parse SVG path:', err);
+    return [];
+  }
 
   const points = [];
   for (const item of pathData.commands) {
@@ -76,7 +98,11 @@ export const toPoints = (d: string) => {
       });
     } else if (item.type === 512) {
       const lastPoint = points[points.length - 1];
-      if (!['M', 'L', 'Q', 'C'].includes(lastPoint.type)) continue;
+      // An arc may appear before any anchor point (e.g. a path that starts with
+      // "A", or one whose leading commands push no point). Without `lastPoint`
+      // there is nothing to arc from, so skip it instead of throwing — this keeps
+      // the documented "malformed path returns []" contract.
+      if (!lastPoint || !['M', 'L', 'Q', 'C'].includes(lastPoint.type)) continue;
 
       const cubicBezierPoints = arcToBezier({
         px: lastPoint.x as number,
@@ -111,30 +137,23 @@ export const toPoints = (d: string) => {
   return points;
 };
 
+const ZERO_RANGE = { minX: 0, minY: 0, maxX: 0, maxY: 0 } as const;
+
 export const getSvgPathRange = (path: string) => {
   try {
-    const pathData = new SVGPathData(path);
-    const xList = [];
-    const yList = [];
-    for (const item of pathData.commands) {
-      const x = 'x' in item ? item.x : 0;
-      const y = 'y' in item ? item.y : 0;
-      xList.push(x);
-      yList.push(y);
+    // Delegate to svg-pathdata's bounds, which correctly account for relative
+    // commands, H/V/Z (which have no x/y), and arc bulge. The previous hand-rolled
+    // version defaulted missing coordinates to 0 — injecting a spurious (0,0) for
+    // Z, treating relative deltas as absolute, and ignoring arc extent.
+    const validation = validateSvgPath(path, RENDER_PATH_LIMITS);
+    if (!validation.ok) return { ...ZERO_RANGE };
+    const { minX, minY, maxX, maxY } = new SVGPathData(validation.commands).getBounds();
+    if ([minX, minY, maxX, maxY].some((v) => v == null || !Number.isFinite(v))) {
+      return { ...ZERO_RANGE };
     }
-    return {
-      minX: Math.min(...xList),
-      minY: Math.min(...yList),
-      maxX: Math.max(...xList),
-      maxY: Math.max(...yList),
-    };
+    return { minX, minY, maxX, maxY };
   } catch {
-    return {
-      minX: 0,
-      minY: 0,
-      maxX: 0,
-      maxY: 0,
-    };
+    return { ...ZERO_RANGE };
   }
 };
 

@@ -1,0 +1,446 @@
+# @openmaic/render-service
+
+Isolated MP4 render service for OpenMAIC's classroom video export (issue #866).
+
+The main app compiles a classroom to a self-contained Hyperframes project ZIP
+(`index.html` + `assets/` + vendored GSAP) entirely in the browser. This service
+takes that ZIP and renders it to an MP4 with [`@hyperframes/producer`], which
+drives headless Chromium (frame capture) + FFmpeg (encode). It runs in its own
+Node 22 container because the producer needs Node ≥ 22, Chromium, and FFmpeg —
+none of which belong in the Next.js runtime.
+
+It is an **opt-in capability**: when the app has no `RENDER_SERVICE_URL`
+configured, in-app export degrades to downloading the project ZIP for local CLI
+rendering. Nothing here is required for the app to run.
+
+## HTTP API
+
+Rendering is asynchronous (a 10-minute video can take tens of minutes): submit,
+poll, then download. Job ids are opaque.
+
+| Method + path                             | Purpose                                                                              |
+| ----------------------------------------- | ------------------------------------------------------------------------------------ |
+| `POST /owner-bound/render`                | multipart: `project` (the ZIP) + `fps`, `quality`, `format` fields → `202 { jobId }` |
+| `POST /preview`                           | JSON: persisted `scene`, stage context, and viewport → synchronous PNG               |
+| `GET /owner-bound/render/:jobId`          | status/progress plus actual capture, worker, profile, and runtime metrics            |
+| `GET /owner-bound/render/:jobId/download` | stream the MP4 (or `302` to a presigned URL) once `succeeded`                        |
+| `DELETE /owner-bound/render/:jobId`       | cancel a queued/running job                                                          |
+| `GET /health`                             | resource profile, observed runtime versions, and whether renders are being admitted  |
+
+`status` is one of `queued | running | succeeded | failed | cancelled`;
+`progress` is `0..1`.
+
+### Video job ownership
+
+Every video job request requires `x-openmaic-render-owner`. The app proxy sets
+this header from `OwnerPrincipal.ownerId` when it submits, polls, cancels, or
+downloads a job. The render service stores that owner on submission and returns
+`404 Job not found` when the owner does not match. A job id alone does not grant
+access. `POST /owner-bound/render` also requires `x-openmaic-client` for admission control.
+
+The render service validates the header format but does not authenticate the
+header. Treat it as an assertion from the trusted app proxy. Keep the service on
+a network that only the app can reach, as the default Compose deployment does.
+For a standalone deployment, put the service behind the app proxy and do not
+publish its port to browsers or other untrusted clients.
+
+Upgrade every render-service instance behind the configured URL (or drain old
+instances) before or together with the main app. Job operations are served only
+under `/owner-bound/render`; legacy `/render` job routes are no longer served.
+The new namespace makes mixed pools fail closed: old service instances refuse
+new job paths, and upgraded instances refuse an old app's legacy paths.
+
+Owner-aware service builds return `x-openmaic-render-owner-bound: 1` on health
+and job responses. The app uses the health marker for its UI capability flag
+and checks each job response as defense in depth. An unmarked response,
+including a namespace 404 from an old instance, is reported as a service error.
+A reverse proxy must never add this marker; it is an assertion made by the
+render service itself.
+
+### Admission: 429s and `/health`
+
+Admission rejections are machine-readable. `POST /owner-bound/render` answers `429` with a
+JSON body `{ error, reason }` where `reason` is one of:
+
+- `queue_full` — the deployment-wide cap `RENDER_MAX_QUEUE` (reserved + queued +
+  running jobs) is exhausted; back off and retry.
+- `per_identity_limit` — this client identity already holds
+  `RENDER_MAX_JOBS_PER_USER` active renders.
+- `resource_unavailable` — the opt-in resource owner is unavailable or admission
+  is closed; operator investigation is required before resuming submissions.
+
+`POST /preview` also answers `429` with `{ error, reason }`, where `reason` is
+one of:
+
+- `preview_queue_full` — `RENDER_PREVIEW_MAX_IN_FLIGHT` previews are already
+  live (buffering or executing).
+- `preview_per_user_limit` — this client identity already holds
+  `RENDER_PREVIEW_MAX_PER_USER` previews.
+- `capacity_busy` — all preview execution slots are occupied by other previews.
+  Previews never queue for these slots; retry later.
+
+An aborted or timed-out preview keeps its execution slot until Chromium launch
+settles and any browser it returns finishes bounded cleanup. Cancellation is
+also passed to the launcher, so a browser still starting is killed rather than
+left running behind a released slot.
+
+The opt-in per-task resource mode does not expose `/preview`: it returns `503`
+with `reason: resource_mode_unsupported` before reading the request body. Preview
+Chromium runs in the HTTP process on the default path and is not part of the
+systemd task fence described below.
+
+`GET /health` reports `accepting: boolean` — whether the queue cap currently has
+room for another **video render** — it reflects the render queue only, not
+preview admission or execution-slot availability. Callers and load balancers
+can shed traffic before probing with a real render. The flag is deliberately
+aggregate-only: no queue depths or occupancy counts, and never any per-identity
+data. Identity keys are client IPs when the service runs behind
+`TRUST_PROXY_HEADERS=true`, so exposing the per-identity map would publish the
+IP address of everyone currently rendering.
+
+Previews have their own execution budget, defaulting to one concurrent preview,
+independent of the video render queue. Once a preview has passed its body and
+semantic checks, it renders immediately or fails with `capacity_busy`. Each
+executing preview launches its own Chromium browser and cleans it up when the
+request finishes or aborts. A video export and a preview can therefore run at
+the same time. Request buffering still shares the bounded extraction gate;
+the preview deadline also covers waiting for that gate.
+
+`/preview` requires fully self-contained scenes (inline code and data: URLs
+only); network, blob:, and relative references are rejected. Slide media must
+use `data:` URLs, and interactive scenes must contain embedded HTML whose
+resource references are inline or `data:` URLs. Non-self-contained inputs fail
+with `422` instead of returning a misleading PNG. Detection is best-effort:
+some exotic external constructs (for example, `object data`, `track src`, and
+CSS `@import`) may pass validation; self-contained scenes are the caller's
+responsibility, and end-to-end fidelity for persisted scenes arrives with
+caller-side preparation (tracked separately).
+
+## Environment
+
+| Var                                      | Default                                        | Meaning                                                                                                                                                                                                                                           |
+| ---------------------------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                                   | `9000`                                         | Listen port.                                                                                                                                                                                                                                      |
+| `RENDER_RESOURCE_PROFILE`                | `standard`                                     | `standard` prefers BeginFrame, permits producer compatibility fallback to screenshot, and requires 8 GiB; `low-memory` forces screenshot capture and requires 4 GiB. Both fix one producer worker, one render, and one extraction.                |
+| `RENDER_MAX_CONCURRENCY`                 | profile: `1`                                   | Must match the selected profile. Renders beyond the single execution slot queue FIFO.                                                                                                                                                             |
+| `RENDER_MAX_CONCURRENT_EXTRACTIONS`      | profile: `1`                                   | Must match the selected profile; bounds archive expansion to one 512 MiB expanded archive at a time.                                                                                                                                              |
+| `RENDER_MAX_JOBS_PER_USER`               | `1`                                            | Active jobs allowed per client identity (0 disables the guard — see note below).                                                                                                                                                                  |
+| `RENDER_MAX_QUEUE`                       | `20`                                           | Max jobs in the system (reserved+queued+running) before new submits get `429`.                                                                                                                                                                    |
+| `RENDER_JOB_TTL_MS`                      | `1800000`                                      | How long finished jobs + artifacts live before cleanup.                                                                                                                                                                                           |
+| `RENDER_JOB_DEADLINE_MS`                 | `2700000`                                      | Hard per-job wall-clock deadline; overruns are aborted and marked **failed**.                                                                                                                                                                     |
+| `RENDER_PREVIEW_TIMEOUT_MS`              | `20000`                                        | Deadline for preview work, including body parsing; launch settlement and bounded browser cleanup complete before the slot is reused.                                                                                                                                                  |
+| `RENDER_PREVIEW_MAX_CONCURRENCY`         | `1`                                            | Maximum executing previews, independent of video exports. At most 2 in `standard`, 1 in `low-memory`; exceeding the profile limit fails startup. Each slot can launch one Chromium browser.                                                                         |
+| `RENDER_PREVIEW_MAX_IN_FLIGHT`           | `8`                                            | Maximum admitted previews across buffering and execution.                                                                                                                                                                                         |
+| `RENDER_PREVIEW_MAX_PER_USER`            | `2`                                            | Concurrent previews per owner identity; 0 disables the guard for deployments whose preview callers do not supply an owner identity (see note below).                                                                                              |
+| `RENDER_PREVIEW_MAX_JSON_BYTES`          | `33554432`                                     | Maximum preview JSON body size (32 MiB), enforced on declared length and streamed bytes independently of the ZIP upload cap.                                                                                                                      |
+| `RENDER_CHUNK_EXECUTION`                 | `false`                                        | Opt in to the bounded local `plan -> renderChunk -> assemble` executor. The HTTP API stays unchanged.                                                                                                                                             |
+| `RENDER_CHUNK_COUNT`                     | `1`                                            | Number of deterministic closed-GOP chunks planned for a render when chunk execution is enabled.                                                                                                                                                   |
+| `RENDER_CHUNK_WORKERS`                   | profile: `1`                                   | Maximum producer capture workers inside one chunk. This remains explicit so chunk fan-out cannot multiply nested producer workers.                                                                                                                |
+| `RENDER_MAX_PARALLEL_CHUNKS`             | `1`                                            | Maximum chunks executed concurrently in the local process. Chunks beyond the bound wait locally.                                                                                                                                                  |
+| `RENDER_CHUNK_SIZE_FRAMES`               | unset                                          | Optional fixed frame count per planned chunk.                                                                                                                                                                                                     |
+| `RENDER_TARGET_CHUNK_FRAMES`             | unset                                          | Optional target frame count used by the producer planner when deriving chunk boundaries.                                                                                                                                                          |
+| `RENDER_MAX_UPLOAD_BYTES`                | `314572800`                                    | Max compressed archive size accepted (300 MB); enforced on real bytes, before buffering.                                                                                                                                                          |
+| `RENDER_MAX_ENTRIES`                     | `5000`                                         | Max entries allowed in the archive.                                                                                                                                                                                                               |
+| `RENDER_MAX_ENTRY_BYTES`                 | `209715200`                                    | Max expanded size of any single entry (200 MB).                                                                                                                                                                                                   |
+| `RENDER_MAX_EXPANDED_BYTES`              | `536870912`                                    | Max total expanded size across all entries (512 MB).                                                                                                                                                                                              |
+| `RENDER_MAX_COMPRESSION_RATIO`           | `200`                                          | Max expanded:compressed ratio per entry (ZIP-bomb guard).                                                                                                                                                                                         |
+| `RENDER_EGRESS_LOCKDOWN`                 | `true`                                         | Install the iptables egress lockdown at startup (needs root + `CAP_NET_ADMIN`); **fails closed** — the container exits if the rules can't be applied. Set `false` to run unisolated.                                                              |
+| `PRODUCER_TMP_PROJECT_DIR`               | `/tmp/openmaic-renders`                        | Scratch dir for unzipped projects + outputs.                                                                                                                                                                                                      |
+| `PRODUCER_BROWSER_GPU_MODE`              | profile-controlled                             | Both profiles use the software/SwiftShader selector; `standard` keeps BeginFrame eligible with `PRODUCER_FORCE_SCREENSHOT=false`, while `low-memory` forces screenshot capture. This is not a host GPU requirement. Do not override it directly.  |
+| `PRODUCER_LOW_MEMORY_MODE`               | profile-controlled                             | Explicitly `false` for `standard` and `true` for `low-memory`; cgroup heuristics cannot silently switch the selected profile.                                                                                                                     |
+| `PRODUCER_MAX_WORKERS`                   | profile: `1`                                   | Explicit for both supported profiles so producer auto-sizing cannot raise the worker count.                                                                                                                                                       |
+| `PRODUCER_ENABLE_BROWSER_POOL`           | profile: `false`                               | Disabled because both supported profiles use one worker; no additional Chromium instances are admitted.                                                                                                                                           |
+| `PRODUCER_HEADLESS_SHELL_PATH`           | `/usr/bin/chromium-headless-shell` (container) | Chromium **headless shell** executable used by producer's beginFrame resolver. Regular Chromium is not equivalent: it may resolve as beginFrame-capable and then reject `HeadlessExperimental.beginFrame`, causing a screenshot fallback.         |
+| `RENDER_REQUIRE_BEGINFRAME`              | profile-controlled                             | `false` for both supported profiles. `standard` requests BeginFrame but accepts producer compatibility fallback; `low-memory` forces screenshot. This internal compatibility knob must not be overridden independently.                           |
+| `PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS` | `900000` (set in Compose)                      | CDP timeout headroom for long frame ranges. The producer default of 300 seconds caused long jobs to fall back from four workers to two.                                                                                                           |
+| `HF_STATIC_DEDUP`                        | `false` (set in Compose)                       | Temporary OpenMAIC-export workaround: these long slide compositions currently exhaust producer's 15-second verification budget and disable dedup anyway. Skipping the doomed verification removes the fixed startup cost without changing frames. |
+| `RENDER_HOME`                            | `/app`                                         | Writable home used after the entrypoint drops privileges. Producer font caches live under `$RENDER_HOME/.cache`, never `/root/.cache`.                                                                                                            |
+| `PUPPETEER_EXECUTABLE_PATH`              | `/usr/bin/chromium-headless-shell`             | System Chromium headless shell (set in the image).                                                                                                                                                                                                |
+
+Chunk settings are profile-bounded: the standard profile allows at most one
+producer worker per chunk and four concurrent chunks; low-memory allows one of
+each. Values above the selected profile limit fail startup rather than
+silently multiplying browser, FFmpeg, and temporary-disk usage.
+
+Client identity for the per-user guard is taken from the `x-openmaic-client`
+header, which the app's proxy sets. A client-supplied `userId` form field is
+ignored. The app derives that header from `x-forwarded-for`/`x-real-ip` **only
+when the operator sets `TRUST_PROXY_HEADERS=true`** (and a real reverse proxy
+overwrites those headers); otherwise all callers share one `direct` identity, so
+the default directly-exposed Compose topology can't be gamed by spoofing
+forwarding headers.
+
+> **Per-user guard vs. shared identity.** Without `TRUST_PROXY_HEADERS=true`
+> every caller collapses into one shared `direct` identity bucket, so any
+> _nonzero_ `RENDER_MAX_JOBS_PER_USER` throttles the whole deployment to that
+> many concurrent renders — not just one user. This is why the default
+> `docker-compose.yml` sets `RENDER_MAX_JOBS_PER_USER=0` (guard off) and relies
+> on `RENDER_MAX_CONCURRENCY` + `RENDER_MAX_QUEUE` (see the comment beside that
+> variable in the Compose file). Enable the per-user guard only behind a trusted
+> proxy that supplies a real per-user identity.
+>
+> Preview callers are different: the app sends the durable session owner id in
+> `x-openmaic-client`, so `RENDER_PREVIEW_MAX_PER_USER` stays enabled and
+> defaults to 2. Set it to 0 only for deployments that call `/preview` without
+> an owner identity.
+
+## Security / isolation
+
+The uploaded archive is untrusted, so extraction is bounded _before_ any bytes
+are decompressed (entry count, per-entry and total expanded size, and
+compression ratio — see the limits above), guarding against ZIP bombs.
+Extraction runs on fflate's worker (off the event loop) and is concurrency-capped
+so admitted jobs can't stack the per-archive RAM ceiling.
+
+The composition HTML is then executed in headless Chromium. Two boundaries keep
+that untrusted page contained:
+
+- **No inbound-to-app bridge.** The container's entrypoint installs an iptables
+  egress lockdown (drop all outbound except loopback + replies on app-initiated
+  connections), so Chromium can't open connections back to the app — even though
+  they share the Compose network so the app can reach the service. This needs the
+  container to run with `CAP_NET_ADMIN` (`cap_add: [NET_ADMIN]`, already set in
+  the Compose file). With `RENDER_EGRESS_LOCKDOWN=true` (the default) the entrypoint
+  **fails closed**: if the rules can't be applied (missing capability, backend
+  mismatch) the container exits non-zero rather than start an unisolated service
+  the app would still advertise as healthy. An operator who knowingly accepts an
+  unisolated standalone setup opts out with `RENDER_EGRESS_LOCKDOWN=false`.
+  `scripts/egress-smoke.sh <image>` asserts the boundary end-to-end (lockdown
+  active, loopback works, a new outbound connection is blocked).
+- **No internet.** In Compose the `render` network is `internal: true` (no host
+  or internet gateway). The export ZIP bundles every asset (and GSAP) at build
+  time, so the render needs no outbound at all.
+
+**When running standalone, place the service on an isolated network yourself**
+(and keep the egress lockdown on, or accept the risk with the toggle) — it needs
+no outbound access.
+
+### Residual risk
+
+The injected CSP plus request interception close script, fetch/XHR, WebSocket,
+image, frame and form egress from the untrusted documents. Two channels remain:
+
+- **Top-level navigation on `/owner-bound/render`.** `location`, a `<meta http-equiv=refresh>`,
+  `window.open` and `target=_top` can replace the top frame; CSP has no
+  `navigate-to` directive, and the producer's browser exposes no request
+  interception we can install. The service therefore relies on the container's
+  egress lockdown: with `RENDER_EGRESS_LOCKDOWN=false`, a rendered page can
+  navigate to any reachable address and the result appears in the output video.
+  Do not run standalone with the lockdown disabled.
+- **Declarative subresources inside a framed SVG/XHTML.** Sanitizing removes
+  script and event handlers, but a surviving `<image href>` (or CSS `url()`)
+  can still load a subresource through a framed document that has no CSP of its
+  own. The lockdown is what blocks that egress in supported deployments.
+
+## Run
+
+### Docker (recommended)
+
+The root `docker-compose.yml` wires this service under the `video-export`
+profile and points the app at it:
+
+```bash
+docker compose --profile video-export up --build
+```
+
+### Standalone (development)
+
+Requires Node 22, Chromium's old headless shell, and FFmpeg on `PATH`. The
+standard profile checks for 8 GiB of available host/cgroup memory before
+listening:
+
+```bash
+cd render-service
+npm install
+PUPPETEER_EXECUTABLE_PATH=$(which chromium-headless-shell) \
+PRODUCER_HEADLESS_SHELL_PATH=$(which chromium-headless-shell) \
+RENDER_RESOURCE_PROFILE=standard \
+PRODUCER_PUPPETEER_PROTOCOL_TIMEOUT_MS=900000 \
+HF_STATIC_DEDUP=false \
+npm start
+```
+
+## Resource profiles
+
+The default `standard` CPU profile is the intended 1080p / 30 fps / standard
+quality path: it prefers BeginFrame, while allowing producer to select screenshot
+for compatibility-sensitive compositions such as iframe GenUI. Producer workers
+are fixed at one, and the service admits one render plus one archive extraction
+at a time. It requires at least 8 GiB of host/cgroup memory and an existing
+headless shell so ordinary compositions remain BeginFrame-eligible. No host GPU
+is required or requested; Chromium uses its software/SwiftShader selector.
+
+Use the `low-memory` profile only when BeginFrame latency is less important
+than a smaller memory ceiling. It fixes screenshot capture, one worker, one
+render, and one extraction, and requires at least 4 GiB:
+
+```bash
+RENDER_RESOURCE_PROFILE=low-memory \
+RENDER_SERVICE_MEMORY_LIMIT=4g \
+docker compose --profile video-export up --build
+```
+
+Both profiles additionally allow one preview to execute by default, alongside
+the video export and extraction. The existing startup minima remain 8 GiB for
+`standard` and 4 GiB for `low-memory`; these are shared by both workloads, not
+separate allowances for each. Preview pixels remain limited to 3840 × 2160 in
+`standard` and 1920 × 1080 in `low-memory` (including device scale factor).
+`RENDER_PREVIEW_MAX_CONCURRENCY` may be raised to 2 in `standard`; `low-memory`
+is capped at 1. A value above the selected profile limit fails startup, just
+like an oversized chunk-concurrency setting. Raising concurrency adds browsers
+without increasing the container memory limit. Measure combined peak memory
+with representative scenes and provision additional RAM before raising it,
+especially when also enabling parallel export chunks.
+
+A bounded concurrent smoke run used the emitted mixed slide/quiz/PBL sample
+(9.1 seconds, 1080p, 30 fps) on `low-memory` with 4 vCPU and a 4 GiB container
+limit. The export completed while 54 consecutive 1080p interactive previews
+returned PNGs; cgroup peak memory was 2.47 GiB with no OOM events. Preview
+latency was 0.31–1.19 seconds. This sample checks the default combined workload,
+not a memory ceiling or latency guarantee for arbitrary scenes or higher
+preview concurrency.
+
+Both `/health` and `GET /owner-bound/render/:jobId` make the selection observable. Health
+reports the configured `previewMaxConcurrency` and the profile ceiling as
+`resourceProfile.maxPreviewConcurrency`, alongside the capture policy, requested
+mode, worker/concurrency bounds, minimum memory, and observed Node, producer,
+Chromium, and FFmpeg versions. A completed job reports requested versus actual
+capture mode and worker count with the same version record, so a
+standard-profile screenshot fallback remains explicit.
+
+The previous fixed 720p short-sample comparison that motivated these profiles was:
+
+| Capture path | Workers | Result                                                |
+| ------------ | ------: | ----------------------------------------------------- |
+| screenshot   |       1 | 28.7 s baseline                                       |
+| BeginFrame   |       1 | 16.3 s, about 43% faster                              |
+| BeginFrame   |       2 | only a small improvement beyond one worker            |
+| BeginFrame   |       4 | no improvement on four vCPU; higher resource pressure |
+
+These measurements justify the one-worker standard, not a general latency SLA.
+The full 1080p sample took 696.9 s with one worker, with capture about 75.5% and
+encode about 20.6% of runtime. Four-worker 1080p/4K and multi-job profiles remain
+unsupported until their combined correctness and memory bounds are validated.
+
+Output parity must be verified separately for each validated profile before
+claiming parity acceptance.
+
+## Scalability
+
+The service is built with three swap points so it can move from a single OSS host
+to a horizontally-scaled demo deployment without changing the HTTP contract or
+the app:
+
+- **`RenderExecutor`** (`src/render-executor.ts`) — `InProcessExecutor` adapts
+  the current HyperFrames producer to stable progress, cancellation, deadline,
+  failure, and performance types. A bounded local or remote executor can replace
+  it without changing `RenderCoordinator` or the routes.
+- **`JobStore`** (`src/job-store.ts`) — Part A ships `InMemoryJobStore`. A
+  `RedisJobStore` implementing the same interface lets any replica serve poll /
+  download requests.
+- **`ArtifactStore`** (`src/artifact-store.ts`) — Part A ships
+  `LocalDiskArtifactStore` (streams through the app proxy). An `S3ArtifactStore`
+  whose `locate` returns a presigned URL makes the download route `302` the
+  browser straight to object storage, bypassing the proxy.
+
+`RenderCoordinator` owns admission, queueing, job state, artifact registration,
+and cleanup while depending only on those three interfaces.
+
+The opt-in local chunk executor uses `@hyperframes/producer/distributed` without
+adding a queue or changing the HTTP contract. It freezes the producer plan and
+runtime versions, bounds chunk fan-out and nested producer workers, verifies
+chunk bytes and sidecar hashes before ordered assembly, and reuses only a valid
+result for an idempotent retry. The default remains the in-process executor.
+
+[`@hyperframes/producer`]: https://www.npmjs.com/package/@hyperframes/producer
+
+### Experimental per-task resource budgets
+
+The opt-in resource executor keeps `RenderCoordinator` as the service's only
+admission and queue owner. A dedicated root process starts each admitted render
+as a transient systemd service before that task imports the official, unmodified
+`@hyperframes/producer` 0.8.37 package. The unit applies the task CPU, memory,
+swap and PID limits to the worker and all Chrome/FFmpeg descendants.
+
+Inside the unit's mount namespace, a private tmpfs supplies `HOME`, `TMPDIR` and
+the render candidate, while the extracted project is mounted read-only. After
+the business worker and descendants drain, the control process copies and
+fsyncs the candidate to a unique staging file on the output filesystem. Before
+that transfer it performs a bounded host-procfs scan for external FD, mmap,
+cwd, root or executable references to the private filesystem; a detected
+reference or unreadable evidence fails closed. The root owner publishes the
+staging file with an atomic rename only after ordinary unmount and systemd
+cgroup removal are both confirmed. Publication and cleanup
+settlement remain separate: an unconfirmed cleanup closes admission and cannot
+report the reservation returned. Before the task runner exits and systemd can
+remove its cgroup, it separately captures `memory.current`, `memory.events`,
+`memory.events.local`, `cpu.stat`, `pids.current`, and `pids.events`. Missing or
+unreadable counters are reported as an accounting collection failure; they do
+not fabricate measurements or change a confirmed cleanup into an unconfirmed
+one.
+
+Start this mode with `npm run start:resources -- /etc/openmaic/resource.json`;
+[`resource-config.example.json`](resource-config.example.json) documents the
+root-owned state directory, fixed tool paths and per-task budget. Provision the
+official alias from the lockfile with browser download disabled when a managed
+browser is already installed (for example, `PUPPETEER_SKIP_DOWNLOAD=true npm ci`).
+The config file, state directory, browser, FFmpeg and installed service code are
+trusted deployment inputs and must not be writable by the HTTP worker. Each
+project directory must be exclusively owned by that worker for the duration of
+its render. The task worker and HTTP service intentionally share the configured
+unprivileged UID; the resource boundary limits each task's descendants but does
+not treat those two same-UID processes as mutually hostile. Candidate transfer
+therefore drops to that UID before opening either source or destination, creates
+the stage exclusively as `0600`, and never asks root to follow a worker-controlled
+path. Because the setuid worker receives absolute paths below the state root,
+that root must be mode `0711` (root-owned and non-writable): other-execute permits
+traversal only, while UUID task directories are also `0711` and their
+request/result files remain root-private `0600`. The dedicated state directory
+must be empty at first startup. An
+owner crash intentionally leaves its lock and/or task directory behind, so a
+restart refuses admission until the platform cleanup is independently audited.
+The reference check assumes readable host procfs, a trusted privileged platform
+and exclusive ownership of the configured roots; it is not protection against
+a privileged process racing the bounded scan.
+
+The standard service and Docker entrypoint keep their current startup and
+privilege model, but the install graph is not byte-for-byte unchanged: it adds
+the official Producer 0.8.37 alias, and shared transitive versions such as
+Puppeteer follow `package-lock.json`. The alias's own HyperFrames transitive
+packages are lockfile-resolved and are not all version 0.8.37. The shipped
+Docker image does not support `start:resources`; use a separately provisioned
+Linux host with systemd, cgroup v2, mount namespaces, `mount`/`umount`, and
+`setpriv`.
+
+This profile is qualified for one render-service instance with one fixed
+per-task budget and one active execution slot. The state-root lock prevents a
+second owner from sharing that root, but instances using different roots do not
+coordinate capacity and can oversubscribe the same host. At startup the one
+instance rejects a budget larger than its effective CPU or memory capacity; the
+coordinator's queue and per-identity slots remain request admission controls,
+not a second resource ledger. The owner treats that fixed budget as reusable
+only after descendant drain, mount cleanup and task-cgroup removal are
+confirmed. Any unverifiable cleanup quarantines the project and state, keeps
+the settlement unreturned and closes admission. While running, the owner also
+samples the shared systemd slice and its memory ancestors: a local `high`, `max`
+or `oom` event, an active `memory.high`, or unreadable/reset evidence closes
+admission until an operator audits and restarts the owner.
+A unit launch failure also retains the task directory and closes admission,
+even when no worker is known to have started. This conservative path does not
+infer safe cleanup from a failed launch command. An operator must audit the
+unit, cgroup, mounts and task state before cleanup and owner restart; there is
+no automatic retry or admission reset.
+
+Fixed-input Linux evidence on Ubuntu 22.04 x86_64 with Node 22.23.2, systemd
+249 and cgroup v2 covers consecutive renders under one owner, cancellation and
+deadline cleanup with same-owner recovery, supervisor-death takeover,
+audio/video temporary paths, external FD/mmap rejection, task OOM enforcement,
+dynamic ancestor-memory pressure, descendant drain, cross-filesystem staging,
+ordinary unmount and publish ordering. The inputs and results are retained
+outside the product repository. These checks qualify the outer execution path
+on that tested platform and workload; they are not a claim that every
+deployment or media composition has been accepted.
+Resource-mode progress stays at `preparing` until the terminal result; intermediate
+frame counts and capture metrics are not reported. Do not interpret unchanged
+progress alone as a hung job; the configured deadline still applies.
+Deployment qualification remains specific to the installed platform and workload.

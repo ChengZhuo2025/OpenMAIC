@@ -11,12 +11,14 @@ import {
   Globe,
   AlertCircle,
   RefreshCw,
+  Trophy,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-import { ThumbnailSlide } from '@/components/slide-renderer/components/ThumbnailSlide';
+import { SlideThumbnail } from '@/components/slide-renderer/SlideThumbnail';
 import { ThumbnailInteractive } from '@/components/slide-renderer/components/ThumbnailInteractive';
 import { useStageStore, useCanvasStore } from '@/lib/store';
 import { useI18n } from '@/lib/hooks/use-i18n';
+import { useNearViewport } from '@/lib/hooks/use-near-viewport';
 import type { SceneType, SlideContent, InteractiveContent } from '@/lib/types/stage';
 import { PENDING_SCENE_ID } from '@/lib/store/stage';
 
@@ -25,6 +27,7 @@ interface SceneSidebarProps {
   readonly onCollapseChange: (collapsed: boolean) => void;
   readonly onSceneSelect?: (sceneId: string) => void;
   readonly onRetryOutline?: (outlineId: string) => Promise<void>;
+  readonly isCourseComplete?: boolean;
 }
 
 const DEFAULT_WIDTH = 220;
@@ -36,12 +39,14 @@ export function SceneSidebar({
   onCollapseChange,
   onSceneSelect,
   onRetryOutline,
+  isCourseComplete,
 }: SceneSidebarProps) {
   const { t } = useI18n();
   const router = useRouter();
   const { scenes, currentSceneId, setCurrentSceneId, generatingOutlines, generationStatus } =
     useStageStore();
   const failedOutlines = useStageStore.use.failedOutlines();
+  const generationInterrupted = useStageStore.use.generationInterrupted();
   const viewportSize = useCanvasStore.use.viewportSize();
   const viewportRatio = useCanvasStore.use.viewportRatio();
 
@@ -199,8 +204,9 @@ export function SceneSidebar({
                 <div className="relative aspect-video w-full rounded overflow-hidden bg-gray-100 dark:bg-gray-800 ring-1 ring-black/5 dark:ring-white/5">
                   <div className="absolute inset-0 flex items-center justify-center">
                     {isSlide && slideContent ? (
-                      <ThumbnailSlide
+                      <LazySlideThumbnail
                         slide={slideContent.canvas}
+                        sceneId={scene.id}
                         viewportSize={viewportSize}
                         viewportRatio={viewportRatio}
                         size={Math.max(100, sidebarWidth - 28)}
@@ -336,7 +342,8 @@ export function SceneSidebar({
           {generatingOutlines.length > 0 &&
             (() => {
               const outline = generatingOutlines[0];
-              const isFailed = failedOutlines.some((f) => f.id === outline.id);
+              const isFailed =
+                generationInterrupted || failedOutlines.some((f) => f.id === outline.id);
               const isRetrying = retryingOutlineId === outline.id;
               const isPaused = generationStatus === 'paused';
               const isActive = currentSceneId === PENDING_SCENE_ID;
@@ -403,7 +410,7 @@ export function SceneSidebar({
                     <div className="absolute inset-0 flex flex-col items-center justify-center gap-1.5">
                       {isFailed ? (
                         <div className="flex items-center gap-1 text-xs font-medium text-red-500/90 dark:text-red-400">
-                          {onRetryOutline ? (
+                          {onRetryOutline && !generationInterrupted ? (
                             <button
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -423,7 +430,9 @@ export function SceneSidebar({
                           <span>
                             {isRetrying
                               ? t('generation.retryingScene')
-                              : t('stage.generationFailed')}
+                              : generationInterrupted
+                                ? t('stage.generationInterrupted')
+                                : t('stage.generationFailed')}
                           </span>
                         </div>
                       ) : (
@@ -453,11 +462,140 @@ export function SceneSidebar({
                 </div>
               );
             })()}
+
+          {/* Course-complete placeholder (shown when outline is exhausted) */}
+          {isCourseComplete &&
+            generatingOutlines.length === 0 &&
+            (() => {
+              const isActive = currentSceneId === PENDING_SCENE_ID;
+              return (
+                <div
+                  key="course-complete-slot"
+                  onClick={() => {
+                    if (onSceneSelect) {
+                      onSceneSelect(PENDING_SCENE_ID);
+                    } else {
+                      setCurrentSceneId(PENDING_SCENE_ID);
+                    }
+                  }}
+                  className={cn(
+                    'group relative rounded-lg flex flex-col gap-1 p-1.5 transition-all duration-200 cursor-pointer hover:bg-amber-50/60 dark:hover:bg-amber-900/10',
+                    !isActive && 'opacity-80',
+                    isActive &&
+                      'bg-amber-50 dark:bg-amber-900/20 ring-1 ring-amber-200 dark:ring-amber-700 opacity-100',
+                  )}
+                >
+                  <div className="flex justify-between items-center px-2 pt-0.5">
+                    <div className="flex items-center gap-2 max-w-full">
+                      <span
+                        className={cn(
+                          'text-[10px] font-black w-4 h-4 rounded-full flex items-center justify-center shrink-0',
+                          isActive
+                            ? 'bg-amber-500 dark:bg-amber-400 text-white shadow-sm shadow-amber-500/30'
+                            : 'bg-amber-100 dark:bg-amber-900/40 text-amber-600 dark:text-amber-400',
+                        )}
+                      >
+                        {scenes.length + 1}
+                      </span>
+                      <span
+                        className={cn(
+                          'text-xs font-bold truncate transition-colors',
+                          isActive
+                            ? 'text-amber-700 dark:text-amber-300'
+                            : 'text-amber-600 dark:text-amber-400',
+                        )}
+                      >
+                        {t('stage.courseComplete')}
+                      </span>
+                    </div>
+                  </div>
+                  <div
+                    className={cn(
+                      'relative aspect-video w-full rounded overflow-hidden ring-1 flex items-center justify-center transition-all',
+                      'bg-amber-50/80 dark:bg-amber-950/20',
+                      isActive
+                        ? 'ring-amber-300 dark:ring-amber-700'
+                        : 'ring-amber-100 dark:ring-amber-900/40',
+                    )}
+                  >
+                    {/* soft radial glow */}
+                    <div
+                      className="absolute inset-0"
+                      style={{
+                        background:
+                          'radial-gradient(circle at 50% 55%, rgba(251, 191, 36, 0.14), transparent 65%)',
+                      }}
+                    />
+                    {/* sparkles (subtle) */}
+                    <svg
+                      viewBox="0 0 20 20"
+                      className="absolute top-1 right-1.5 w-1.5 h-1.5 text-amber-300/70 dark:text-amber-400/60"
+                      aria-hidden
+                    >
+                      <path
+                        d="M10 1 L12 8 L19 10 L12 12 L10 19 L8 12 L1 10 L8 8 Z"
+                        fill="currentColor"
+                      />
+                    </svg>
+                    <svg
+                      viewBox="0 0 20 20"
+                      className="absolute bottom-1 left-1.5 w-1 h-1 text-amber-300/60 dark:text-amber-400/50"
+                      aria-hidden
+                    >
+                      <path
+                        d="M10 1 L12 8 L19 10 L12 12 L10 19 L8 12 L1 10 L8 8 Z"
+                        fill="currentColor"
+                      />
+                    </svg>
+                    <Trophy
+                      className="relative w-8 h-8 text-amber-500 dark:text-amber-400"
+                      strokeWidth={1.6}
+                    />
+                  </div>
+                </div>
+              );
+            })()}
         </div>
 
         {/* Spacer to push toggle button area */}
         <div className="mt-auto" />
       </div>
+    </div>
+  );
+}
+
+/**
+ * Viewport-gated slide thumbnail for the playback sidebar. Scenes far outside
+ * the viewport render SlideThumbnail's cheap placeholder instead of a full
+ * SlideCanvas — which also spares every off-screen video element its
+ * `preload="metadata"` fetch when the classroom opens. The placeholder keeps
+ * the same box size, so gating never shifts layout.
+ */
+function LazySlideThumbnail({
+  slide,
+  sceneId,
+  viewportSize,
+  viewportRatio,
+  size,
+}: {
+  readonly slide: SlideContent['canvas'];
+  readonly sceneId: string;
+  readonly viewportSize: number;
+  readonly viewportRatio: number;
+  readonly size: number;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const visible = useNearViewport(ref);
+  return (
+    <div ref={ref} className="flex h-full w-full items-center justify-center">
+      <SlideThumbnail
+        slide={slide}
+        sceneId={sceneId}
+        viewportSize={viewportSize}
+        viewportRatio={viewportRatio}
+        size={size}
+        visible={visible}
+      />
     </div>
   );
 }

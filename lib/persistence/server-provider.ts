@@ -1,0 +1,199 @@
+import { PgAssetStore, ensureAssetSchema } from '@openmaic/storage/asset/pg';
+import {
+  PgDocumentStore,
+  ensureDocumentSchema,
+  type Queryable,
+  type WithTransaction,
+} from '@openmaic/storage/document/pg';
+import { PgRuntimeStore, ensureSchema } from '@openmaic/storage/runtime/pg';
+import {
+  nodePostgresTransaction,
+  type ConnectableQueryable,
+} from '@openmaic/storage/server/reference';
+import { Pool } from 'pg';
+
+import { validateAppScene, validateAppStage } from '@/lib/document-store/validators';
+import { configuredLazyAssetByteStore } from '@/lib/persistence/asset-byte-store';
+import { resolveAssetPendingTtlMs } from '@/lib/persistence/asset-pending-ttl';
+import { resolveAssetQuotaBytes } from '@/lib/persistence/asset-quota';
+import { ensureLegacyClassroomImportSchema } from '@/lib/persistence/legacy-classroom-imports';
+import { ensureOwnerMaterialSchema } from '@/lib/persistence/owner-materials';
+import { fenceOwnerWrite } from '@/lib/persistence/owner-merges';
+import { withSchemaBootstrapLock } from '@/lib/persistence/schema-bootstrap-lock';
+import { ensureWorkspaceModelConfigSchema } from '@/lib/persistence/workspace-model-config';
+import { ensureStageMetaSchema } from '@/lib/persistence/stage-meta';
+import { APP_RUNTIME_PAYLOAD_VALIDATORS } from '@/lib/runtime/payload-validators';
+import { ensureOwnerAgentSchema } from '@/lib/server/agents/store';
+
+export type PersistencePoolFactory = (connectionString: string) => Pool;
+
+/**
+ * How long a caller waits for a pooled connection before the acquire fails.
+ * `pg` waits forever by default, so an exhausted pool would leave every
+ * request queued behind it hanging with no error, no log and no way for its
+ * caller to fail over.
+ */
+export const PERSISTENCE_POOL_CONNECTION_TIMEOUT_MS = 10_000;
+
+/** The persistence pool a deployment gets unless it passes its own factory. */
+export const defaultPersistencePool: PersistencePoolFactory = (connectionString) =>
+  new Pool({
+    connectionString,
+    connectionTimeoutMillis: PERSISTENCE_POOL_CONNECTION_TIMEOUT_MS,
+  });
+
+/**
+ * The process's persistence stores. There is deliberately no document store
+ * here: an unscoped `PgDocumentStore` would write courses with no owner check
+ * and no host create hooks. Documents are reached only through the
+ * owner-bound store (`createOwnerBoundDocumentStore`,
+ * `getOwnerScopedDocumentStore`).
+ */
+export interface ServerPersistenceProvider {
+  pool: Pool;
+  runtimeStore: PgRuntimeStore;
+  assetStore: PgAssetStore;
+  /** Pin a body to one fresh transaction on the pool. */
+  withTransaction: WithTransaction;
+  /**
+   * The asset registry with every statement on `queryable`, an already open
+   * transaction, for a caller that must check and mutate atomically.
+   */
+  assetStoreIn(queryable: Queryable): ServerPersistenceProvider['assetStore'];
+}
+
+interface ProviderState {
+  connectionString?: string;
+  providerPromise?: Promise<ServerPersistenceProvider>;
+}
+
+const PROVIDER_STATE_KEY = Symbol.for('openmaic.persistence.provider');
+const globalState = globalThis as typeof globalThis & {
+  [key: symbol]: ProviderState | undefined;
+};
+const providerState = (globalState[PROVIDER_STATE_KEY] ??= {});
+
+async function createServerPersistenceProvider(
+  connectionString: string,
+  poolFactory: PersistencePoolFactory,
+): Promise<ServerPersistenceProvider> {
+  // Resolved before anything is opened: a malformed ceiling is a configuration
+  // mistake, and refusing it here costs no connection and no schema work.
+  // Allocation is reachable by any caller this deployment admits, so the
+  // store's own quota is what keeps it from growing without bound.
+  const quotaBytes = resolveAssetQuotaBytes();
+  // Same reason, same moment: the window an allocation has to be claimed by a
+  // document before the collector expires it.
+  const pendingTtlMs = resolveAssetPendingTtlMs();
+  const pool = poolFactory(connectionString);
+  const queryable = pool as unknown as ConnectableQueryable;
+  try {
+    // One instance at a time: see withSchemaBootstrapLock. The ownership
+    // backfill in ensureStageMetaSchema runs under the same lock, before any
+    // store below is built.
+    await withSchemaBootstrapLock(queryable, async (locked) => {
+      await ensureSchema(locked);
+      await ensureDocumentSchema(locked);
+      await ensureStageMetaSchema(locked);
+      await ensureOwnerMaterialSchema(locked);
+      await ensureAssetSchema(locked);
+      await ensureLegacyClassroomImportSchema(locked);
+      await ensureWorkspaceModelConfigSchema(locked);
+      await ensureOwnerAgentSchema(locked);
+    });
+    const withTransaction = nodePostgresTransaction(queryable);
+    const byteStore = configuredLazyAssetByteStore(queryable);
+    const documentStore = new PgDocumentStore(queryable, {
+      withTransaction,
+      validateScene: validateAppScene,
+      validateStage: validateAppStage,
+      // Unconditional, and it has to be: this function is the only place
+      // that decides what server-backed persistence is, and it always
+      // ensures the asset schema and always leaves the collector's entry
+      // pass on. A document store that did not record references would let
+      // that pass expire allocations live documents name.
+      trackAssetReferences: true,
+    });
+    // Say so on the database, rather than waiting for a document write to say
+    // it by accident.
+    //
+    // The collector's entry level refuses to run until some write has recorded
+    // a reference, which is the right refusal: releasing entries on a database
+    // no writer maintains would delete assets live documents name. But the
+    // only thing that used to answer it was a document write, so a cold
+    // install -- and an upgraded database that already holds documents, which
+    // is the case that matters -- sat refused until someone happened to save a
+    // course, and the one-time backfill sat with it. Every store this function
+    // builds is a reference writer, and this function is the only thing that
+    // builds them, so it is exactly the thing entitled to declare it.
+    //
+    // Not swallowed: the same posture as the schema work above. If this fails
+    // the provider fails, the pool is closed, and the next request retries a
+    // fresh initialization -- because a provider that came up without the
+    // declaration would leave reclamation refused with nothing to notice it.
+    await documentStore.declareAssetReferenceTracking();
+    const assetRegistry = (on: Queryable, transaction: WithTransaction) =>
+      new PgAssetStore(on, {
+        withTransaction: transaction,
+        byteStore,
+        pendingTtlMs,
+        ...(quotaBytes === undefined ? {} : { quotaBytes }),
+      });
+    return {
+      pool,
+      runtimeStore: new PgRuntimeStore(queryable, {
+        withTransaction,
+        payloadValidators: APP_RUNTIME_PAYLOAD_VALIDATORS,
+        // Every runtime session is created by a request (the persistence
+        // route, the chat route's whiteboard), for the request's owner: the
+        // identity lock first, and a retired owner is refused
+        // (./owner-merges.ts), so a create racing a claim either lands before
+        // it and is moved, or is refused -- never left under the retired id.
+        resolveFinalLearner: async (transaction, learnerKey) => {
+          await fenceOwnerWrite(transaction, learnerKey);
+          return learnerKey;
+        },
+      }),
+      assetStore: assetRegistry(queryable, withTransaction),
+      withTransaction,
+      assetStoreIn: (pinned) => assetRegistry(pinned, (body) => body(pinned)),
+    };
+  } catch (error) {
+    await pool.end().catch(() => {});
+    throw error;
+  }
+}
+
+/**
+ * Shared server bootstrap used by both HTTP persistence and Pi composition.
+ *
+ * The memo is keyed on the TRIMMED connection string, and the pool is built
+ * from it, because callers disagree about whose job that is: the persistence
+ * route and the agent runtime pass `process.env.DATABASE_URL` as it is, while
+ * the collector schedule and the shutdown hook trim it first — they need the
+ * trimmed value anyway, to tell a blank variable from an unset one. A
+ * whitespace-padded `DATABASE_URL` would otherwise memoise twice and open two
+ * pools for one database in one process, and every one of those callers would
+ * be individually correct. Normalizing at the one seam they all go through
+ * costs nothing and leaves no spelling that can split them.
+ */
+export function getServerPersistenceProvider(
+  connectionString: string,
+  poolFactory: PersistencePoolFactory = defaultPersistencePool,
+): Promise<ServerPersistenceProvider> {
+  const key = connectionString.trim();
+  if (providerState.providerPromise && providerState.connectionString === key) {
+    return providerState.providerPromise;
+  }
+
+  providerState.connectionString = key;
+  const initialization = createServerPersistenceProvider(key, poolFactory).catch((error) => {
+    if (providerState.providerPromise === initialization) {
+      providerState.providerPromise = undefined;
+      providerState.connectionString = undefined;
+    }
+    throw error;
+  });
+  providerState.providerPromise = initialization;
+  return initialization;
+}

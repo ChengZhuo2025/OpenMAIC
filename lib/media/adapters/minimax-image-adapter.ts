@@ -9,6 +9,10 @@ import type {
   ImageGenerationOptions,
   ImageGenerationResult,
 } from '../types';
+import { mediaFetchFor } from '../media-fetch';
+import { connectivityHttpFailure, connectivityTransportFailure } from '../probe-auth';
+import { assertNotRedirected } from '../redirect-guard';
+import { requireModel } from '../require-model';
 
 const BASE_URL = 'https://api.minimaxi.com';
 
@@ -18,12 +22,13 @@ export async function generateWithMiniMaxImage(
 ): Promise<ImageGenerationResult> {
   const baseUrl = (config.baseUrl || BASE_URL).replace(/\/$/, '');
 
-  const model = config.model || 'image-01';
+  const model = requireModel(config.model, 'MiniMax Image');
 
   const aspectRatio = options.aspectRatio || '1:1';
 
-  const response = await fetch(`${baseUrl}/v1/image_generation`, {
+  const response = await mediaFetchFor(config)(`${baseUrl}/v1/image_generation`, {
     method: 'POST',
+    redirect: 'manual',
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
       'Content-Type': 'application/json; charset=utf-8',
@@ -38,6 +43,8 @@ export async function generateWithMiniMaxImage(
       prompt_optimizer: false,
     }),
   });
+
+  assertNotRedirected(response, 'MiniMax Image');
 
   if (!response.ok) {
     const errText = await response.text().catch(() => response.statusText);
@@ -86,30 +93,30 @@ export async function generateWithMiniMaxImage(
 export async function testMiniMaxImageConnectivity(
   config: ImageGenerationConfig,
 ): Promise<{ success: boolean; message: string }> {
+  const baseUrl = (config.baseUrl || BASE_URL).replace(/\/$/, '');
+  let response: Response;
   try {
-    const baseUrl = (config.baseUrl || BASE_URL).replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/v1/image_generation`, {
+    response = await mediaFetchFor(config)(`${baseUrl}/v1/image_generation`, {
       method: 'POST',
+      redirect: 'manual',
       headers: {
         Authorization: `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json; charset=utf-8',
       },
       body: JSON.stringify({
-        model: 'image-01',
+        model: requireModel(config.model, 'MiniMax Image'),
         prompt: 'test',
         aspect_ratio: '1:1',
         n: 1,
       }),
     });
-
-    if (response.ok) {
-      return { success: true, message: 'MiniMax Image API connected' };
-    }
-
-    const errData = await response.json().catch(() => ({}));
-    const msg = errData?.base_resp?.status_msg || response.statusText;
-    return { success: false, message: `API error: ${msg}` };
   } catch (err) {
-    return { success: false, message: `Connection failed: ${(err as Error).message}` };
+    return connectivityTransportFailure('MiniMax Image', err);
   }
+  await response.body?.cancel().catch(() => undefined);
+
+  if (response.ok) {
+    return { success: true, message: 'MiniMax Image API connected' };
+  }
+  return connectivityHttpFailure('MiniMax Image', response.status);
 }

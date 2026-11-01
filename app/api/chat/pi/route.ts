@@ -1,0 +1,387 @@
+/**
+ * Pi Director Chat API Endpoint
+ *
+ * POST /api/chat/pi - runs the in-class multi-agent chain as a single
+ * server-side Pi agent loop.
+ */
+import { attachInteractiveState } from '@/lib/chat/pi/interactive-state-evidence';
+import { ModelAuthorizationError } from '@/lib/server/model-config/model-authorization';
+import { PiGeminiNativeRequiredError } from '@/lib/server/model-config/pi-gemini-route';
+import { SlotRequirementError } from '@/lib/server/model-config/llm';
+
+import { NextRequest } from 'next/server';
+import { isProviderKeyRequired } from '@/lib/ai/providers';
+import {
+  isCoursewareReferenceEnabled,
+  isPiNativeChildRuntimeEnabled,
+  isPiNativeChildSpotlightEnabled,
+} from '@/lib/config/feature-flags';
+import { createLogger } from '@/lib/logger';
+import { resolveAgentConfigs } from '@/lib/chat/pi/config';
+import { runPiDirectorLoop } from '@/lib/chat/pi/director-loop';
+import type { SendEvent } from '@/lib/chat/pi/types';
+import { requestWorkspaceId } from '@/lib/server/model-config/runtime';
+import { resolveModel } from '@/lib/server/resolve-model';
+import { parseUserStageRoutes } from '@/lib/server/model-routes';
+import { apiError } from '@/lib/server/api-response';
+import type { ThinkingConfig } from '@/lib/types/provider';
+import type { StatelessChatRequest } from '@/lib/types/chat';
+import { resolveClassroomWebSearchConfig } from '@/lib/server/web-search-config';
+import { resolveRequestOwner } from '@/lib/server/identity/resolve';
+import {
+  attachOwnerCookies,
+  invalidOwnerCredentialResponse,
+} from '@/lib/server/identity/with-owner';
+import type { OwnerPrincipal } from '@/lib/server/identity/types';
+import { guardedServerRuntimeStore } from '@/lib/persistence/runtime-tombstone-guard';
+import { getServerPersistenceProvider } from '@/lib/persistence/server-provider';
+import { createWhiteboardRuntimeService } from '@/lib/whiteboard/runtime/store';
+import { hasNativeWhiteboardAction } from '@/lib/chat/pi/tools/native-whiteboard';
+import {
+  ELEMENT_REFERENCE_ACCEPTED_HEADER,
+  ElementReferenceValidationError,
+  resolveElementReference,
+} from '@/lib/chat/pi/element-reference';
+
+const log = createLogger('Pi Chat API');
+
+export async function POST(req: NextRequest) {
+  // Like every owner-resolving route, a request whose credential an owner
+  // auth method refuses is refused here, before any model work. With the
+  // default anonymous fallback resolution always succeeds, so this only
+  // refuses requests under a host method that can reject (an expired token,
+  // say) or with the fallback off. Memoized, so the whiteboard branch below
+  // reuses this resolution.
+  const owner = await resolveRequestOwner(req);
+  if (!owner.ok) {
+    return invalidOwnerCredentialResponse();
+  }
+  // Every answer carries the resolution's cookies (the anonymous owner's
+  // renewal), errors included; the stream gets them on its headers before
+  // its body starts.
+  return attachOwnerCookies(await chat(req, owner.principal), owner.setCookies);
+}
+
+async function chat(req: NextRequest, principal: OwnerPrincipal): Promise<Response> {
+  const encoder = new TextEncoder();
+  let chatModel: string | undefined;
+  let chatMessageCount: number | undefined;
+
+  try {
+    const body: StatelessChatRequest = await req.json();
+    chatModel = body.model;
+    chatMessageCount = body.messages?.length;
+
+    if (!body.messages || !Array.isArray(body.messages)) {
+      return apiError('MISSING_REQUIRED_FIELD', 400, 'Missing required field: messages');
+    }
+
+    if (!body.storeState) {
+      return apiError('MISSING_REQUIRED_FIELD', 400, 'Missing required field: storeState');
+    }
+
+    if (!body.config || body.config.agentIds == null) {
+      return apiError('MISSING_REQUIRED_FIELD', 400, 'Missing required field: config.agentIds');
+    }
+
+    if (
+      (body.elementReference !== undefined || body.interactiveState !== undefined) &&
+      !isCoursewareReferenceEnabled()
+    ) {
+      return apiError('INVALID_REQUEST', 400, 'Courseware references are disabled');
+    }
+
+    // Non-object members (null, primitives, arrays) are never valid scenes and
+    // null throws on scene.id / scene.order in reference lookup and later scene
+    // iteration. Rejecting them once here covers every path before reference
+    // resolution and model resolution.
+    if (
+      Array.isArray(body.storeState.scenes) &&
+      body.storeState.scenes.some(
+        (scene) => typeof scene !== 'object' || scene === null || Array.isArray(scene),
+      )
+    ) {
+      return apiError('INVALID_REQUEST', 400, 'storeState.scenes members must be objects');
+    }
+
+    let elementReference;
+    try {
+      elementReference = resolveElementReference(body);
+    } catch (error) {
+      if (error instanceof ElementReferenceValidationError) {
+        return apiError(
+          'INVALID_REQUEST',
+          400,
+          error.message,
+          undefined,
+          body.elementReference?.kind === 'whiteboard_element'
+            ? 'whiteboard_reference_changed'
+            : undefined,
+        );
+      }
+      throw error;
+    }
+
+    let interactiveStateNote;
+    try {
+      ({ elementReference, stateNote: interactiveStateNote } = attachInteractiveState(
+        body,
+        elementReference,
+      ));
+    } catch (error) {
+      if (error instanceof ElementReferenceValidationError) {
+        return apiError('INVALID_REQUEST', 400, error.message);
+      }
+      throw error;
+    }
+
+    const agentIds = body.config.agentIds;
+    if (
+      !Array.isArray(agentIds) ||
+      agentIds.length === 0 ||
+      agentIds.some((id) => typeof id !== 'string' || id.trim().length === 0 || id !== id.trim()) ||
+      new Set(agentIds).size !== agentIds.length
+    ) {
+      return apiError(
+        'INVALID_REQUEST',
+        400,
+        'config.agentIds must be a non-empty array of unique, non-empty strings',
+      );
+    }
+
+    const {
+      model: languageModel,
+      apiKey: resolvedApiKey,
+      providerId,
+      modelInfo,
+      thinkingConfig: resolvedThinkingConfig,
+    } = await resolveModel({
+      modelString: body.model,
+      stage: 'chat-adapter',
+      requireToolCalling: true,
+      workspaceId: await requestWorkspaceId(req),
+      // Honor the classroom-interaction per-stage override the client sends in
+      // `x-model-routes`. A routed stage brings its own key and base URL; otherwise the body credentials are used (never x-* headers).
+      userRoutes: parseUserStageRoutes(req.headers.get('x-model-routes')),
+      apiKey: body.apiKey,
+      baseUrl: body.baseUrl,
+      providerType: body.providerType,
+      // Let resolveModel arbitrate thinking too: a routed chat-adapter's thinking
+      // wins, an unrouted one honors this client thinking (see resolve-model.ts).
+      thinkingConfig: body.thinkingConfig ?? body.thinking,
+    });
+
+    if (isProviderKeyRequired(providerId) && !resolvedApiKey) {
+      return apiError('MISSING_API_KEY', 401, 'API Key is required');
+    }
+
+    const agentConfigs = resolveAgentConfigs(body);
+    const resolvedAgentIds = new Set(agentConfigs.map((agent) => agent.id));
+    const unresolvedAgentIds = agentIds.filter((id) => !resolvedAgentIds.has(id));
+    if (unresolvedAgentIds.length > 0) {
+      return apiError(
+        'INVALID_REQUEST',
+        400,
+        `Unknown classroom agents in config.agentIds: ${unresolvedAgentIds.join(', ')}`,
+      );
+    }
+    if (agentConfigs.length === 0) {
+      return apiError(
+        'INVALID_REQUEST',
+        400,
+        `No valid classroom agents found for config.agentIds: ${body.config.agentIds.join(', ')}`,
+      );
+    }
+
+    const signal = req.signal;
+
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+
+    const send: SendEvent = async (event) => {
+      await writer.write(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
+    };
+
+    const thinkingConfig: ThinkingConfig = resolvedThinkingConfig ?? {
+      mode: 'disabled',
+      enabled: false,
+    };
+
+    const enableWhiteboardTools = body.config.piEnableWhiteboardTools === true;
+    const childRuntimeMode = isPiNativeChildRuntimeEnabled() ? 'native' : 'legacy';
+    const enableNativeChildSpotlight = isPiNativeChildSpotlightEnabled();
+    const requestStartStageId = body.storeState.stage?.id;
+    const validRequestStartStageId =
+      typeof requestStartStageId === 'string' &&
+      requestStartStageId.length > 0 &&
+      requestStartStageId === requestStartStageId.trim()
+        ? requestStartStageId
+        : undefined;
+    const nativeWhiteboardRequested = agentConfigs.some((agent) =>
+      hasNativeWhiteboardAction(agent.allowedActions),
+    );
+    let nativeWhiteboardService: ReturnType<typeof createWhiteboardRuntimeService> | undefined;
+    let nativeWhiteboardLearnerKey: string | undefined;
+    if (
+      childRuntimeMode === 'native' &&
+      enableWhiteboardTools &&
+      nativeWhiteboardRequested &&
+      validRequestStartStageId &&
+      process.env.DATABASE_URL
+    ) {
+      // The runtime learner key is the request owner, exactly as on
+      // /api/persistence/runtime/*; nothing the client sends chooses it.
+      const learnerKey = principal.ownerId;
+      try {
+        const provider = await getServerPersistenceProvider(process.env.DATABASE_URL);
+        nativeWhiteboardLearnerKey = learnerKey;
+        nativeWhiteboardService = createWhiteboardRuntimeService({
+          // Guarded like /api/persistence/runtime/*: a deleted course takes
+          // no new runtime from the whiteboard either.
+          store: guardedServerRuntimeStore(provider.runtimeStore, provider.pool),
+          resolveLearnerKey: () => learnerKey,
+        });
+      } catch {
+        log.warn('Native whiteboard capability unavailable: persistence initialization failed');
+      }
+    }
+    let nativeWebSearchConfig: Awaited<ReturnType<typeof resolveClassroomWebSearchConfig>>;
+    try {
+      nativeWebSearchConfig =
+        childRuntimeMode === 'native'
+          ? await resolveClassroomWebSearchConfig(await requestWorkspaceId(req), {
+              webSearchProviderId: body.webSearchProviderId,
+              webSearchApiKey: body.webSearchApiKey,
+              webSearchBaseUrl: body.webSearchBaseUrl,
+              webSearchModelId: body.webSearchModelId,
+              baiduSubSources: body.baiduSubSources,
+            })
+          : undefined;
+    } catch (error) {
+      if (error instanceof ModelAuthorizationError)
+        return apiError(error.code, error.httpStatus, error.message);
+      const message = error instanceof Error ? error.message : 'Invalid Web Search configuration';
+      return apiError('INVALID_REQUEST', 400, message);
+    }
+
+    log.info(
+      `Pi request agents=${body.config.agentIds.join(', ')} messages=${body.messages.length}`,
+    );
+
+    (async () => {
+      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+      const startHeartbeat = () => {
+        heartbeatTimer = setInterval(() => {
+          writer.write(encoder.encode(`:heartbeat\n\n`)).catch(() => stopHeartbeat());
+        }, 15_000);
+      };
+      const stopHeartbeat = () => {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+      };
+
+      try {
+        startHeartbeat();
+
+        await runPiDirectorLoop({
+          body,
+          elementReference,
+          interactiveStateNote,
+          agentConfigs,
+          send,
+          languageModel,
+          thinkingConfig,
+          maxOutputTokens: modelInfo?.outputWindow,
+          contextWindow: modelInfo?.contextWindow,
+          abortSignal: signal,
+          signal,
+          enableWhiteboardTools,
+          childRuntimeMode,
+          enableNativeChildSpotlight,
+          nativeWebSearchConfig,
+          nativeWhiteboardService,
+          nativeWhiteboardStageId: nativeWhiteboardService ? validRequestStartStageId : undefined,
+          nativeWhiteboardLearnerKey,
+          requestStartManualVisibilityRevision:
+            Number.isSafeInteger(body.storeState.whiteboardManualVisibilityRevision) &&
+            (body.storeState.whiteboardManualVisibilityRevision ?? -1) >= 0
+              ? body.storeState.whiteboardManualVisibilityRevision
+              : 0,
+        });
+
+        if (signal.aborted) {
+          stopHeartbeat();
+          await writer.close();
+          return;
+        }
+
+        stopHeartbeat();
+        await writer.close();
+      } catch (error) {
+        stopHeartbeat();
+
+        if (signal.aborted) {
+          try {
+            await writer.close();
+          } catch {
+            /* already closed */
+          }
+          return;
+        }
+
+        log.error('Pi chat stream error:', error);
+        try {
+          await send({
+            type: 'error',
+            data: { message: error instanceof Error ? error.message : String(error) },
+          });
+          await writer.close();
+        } catch {
+          /* writer may already be closed */
+        }
+      }
+    })();
+
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        ...(elementReference ? { [ELEMENT_REFERENCE_ACCEPTED_HEADER]: '1' } : {}),
+      },
+    });
+  } catch (error) {
+    if (error instanceof PiGeminiNativeRequiredError) {
+      return apiError(
+        'MODEL_CONFIG_INVALID',
+        400,
+        error.message,
+        undefined,
+        'gemini_native_required',
+      );
+    }
+    if (error instanceof SlotRequirementError) {
+      return apiError(
+        'MODEL_CONFIG_INVALID',
+        400,
+        'Pi classroom chat requires a model that supports tool calling. Select one for the classroom slot in Settings → Course Model Config, or contact your administrator if this setting is managed.',
+        undefined,
+        'tool_calling_required',
+      );
+    }
+    if (error instanceof ModelAuthorizationError) {
+      return apiError('PROVIDER_DISABLED', 403, error.message);
+    }
+    log.error(
+      `Pi chat request failed [model=${chatModel ?? 'unknown'}, messages=${chatMessageCount ?? 0}]:`,
+      error,
+    );
+    return apiError(
+      'INTERNAL_ERROR',
+      500,
+      error instanceof Error ? error.message : 'Failed to process request',
+    );
+  }
+}
